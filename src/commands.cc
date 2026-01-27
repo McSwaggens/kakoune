@@ -499,6 +499,13 @@ void edit(const ParametersParser& parser, Context& context, const ShellContext&)
             buffer = open_fifo(name, *fifo, flags, (bool)parser.get_switch("scroll"));
         else if (not buffer)
         {
+            auto parsed_name = parse_filename(name);
+            if (is_directory(parsed_name))
+            {
+                CommandManager::instance().execute_single_command(
+                    {"browse-directory", parsed_name}, context, {});
+                return;
+            }
             buffer = parser.get_switch("existing") ? open_file_buffer(name, flags)
                                                    : open_or_create_file_buffer(name, flags);
             if (buffer->flags() & Buffer::Flags::New)

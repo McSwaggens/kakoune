@@ -774,12 +774,19 @@ int run_server(StringView session, StringView server_init,
                                      "    {}", error.what()));
     }
 
+    String deferred_directory_cmds;
     if (not files.empty()) try
     {
         for (auto& file : files)
         {
             try
             {
+                auto path = parse_filename(file);
+                if (is_directory(path))
+                {
+                    deferred_directory_cmds += format("browse-directory '{}';", escape(path, "'", '\''));
+                    continue;
+                }
                 Buffer *buffer = open_or_create_file_buffer(file);
                 if (flags & ServerFlags::ReadOnly)
                 {
@@ -815,8 +822,9 @@ int run_server(StringView session, StringView server_init,
 
         if (not server.is_daemon())
         {
+            auto full_client_init = deferred_directory_cmds + client_init;
             local_client = client_manager.create_client(
-                 create_local_ui(ui_type), getpid(), {}, get_env_vars(), client_init, init_buffer, std::move(init_coord),
+                 create_local_ui(ui_type), getpid(), {}, get_env_vars(), full_client_init, init_buffer, std::move(init_coord),
                  [&](int status) { exit_status = status; });
 
             if (startup_error and local_client)
