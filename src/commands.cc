@@ -464,7 +464,11 @@ void edit(const ParametersParser& parser, Context& context, const ShellContext&)
     const bool scratch = (bool)parser.get_switch("scratch");
 
     if (parser.positional_count() == 0 and not force_reload and not scratch)
-        throw wrong_argument_count();
+    {
+        CommandManager::instance().execute_single_command(
+            {"browse-directory"}, context, {});
+        return;
+    }
 
     const bool no_hooks = context.hooks_disabled();
     const auto flags = (no_hooks ? Buffer::Flags::NoHooks : Buffer::Flags::None) |
