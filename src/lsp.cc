@@ -228,6 +228,26 @@ const Value* find_member(const Value& v, StringView key)
     return it != o.end() ? &it->value : nullptr;
 }
 
+// Map an LSP semantic token (type + modifiers) to a face. Mirrors the user's
+// former kak-lsp lsp_semantic_tokens config. Unmapped tokens return empty so
+// they keep their syntax-highlighting colors.
+StringView semantic_face(StringView type, bool readonly, bool user_defined)
+{
+    if (type == "variable" and readonly) return "constant";
+    if (type == "parameter")             return "parameter";
+    if (type == "class")                 return "user_type";
+    if (type == "type" and user_defined) return "user_type";
+    if (type == "typeParameter")         return "user_type";
+    if (type == "property")              return "member_variable";
+    if (type == "enum")                  return "user_type";
+    if (type == "namespace")             return "user_type";
+    if (type == "macro")                 return "constant";
+    if (type == "enumMember")            return "constant";
+    if (type == "variable")              return "variable";
+    if (type == "function")              return "function";
+    return {};
+}
+
 void setup_lsp_window(Context& context)
 {
     if (not context.has_window())
@@ -237,6 +257,7 @@ void setup_lsp_window(Context& context)
         try { cm.execute(command, context); }
         catch (runtime_error&) {} // already set up on this window
     };
+    run("add-highlighter window/lsp_semantic_tokens ranges lsp_semantic_tokens");
     run("add-highlighter window/lsp_diagnostic_ranges ranges lsp_diagnostic_ranges");
     run("add-highlighter window/lsp_diagnostic_lines flag-lines Default lsp_diagnostic_lines");
     // Completion: the stock option= completer renders lsp_completions, which we
@@ -244,6 +265,10 @@ void setup_lsp_window(Context& context)
     run("set-option -add window completers option=lsp_completions");
     run("remove-hooks window lsp-completion");
     run("hook -group lsp-completion window InsertIdle .* lsp-complete");
+    // Semantic highlighting: refresh when idle in normal mode / on reload.
+    run("remove-hooks window lsp-semantic");
+    run("hook -group lsp-semantic window NormalIdle .* lsp-semantic-tokens");
+    run("hook -group lsp-semantic window BufReload .* lsp-semantic-tokens");
 }
 
 }
@@ -259,6 +284,8 @@ LSPManager::LSPManager()
         "diagnostics from the language server, as faces over ranges", {});
     reg.declare_option<LineAndSpecList>("lsp_diagnostic_lines",
         "diagnostic gutter flags from the language server", {});
+    reg.declare_option<RangeAndStringList>("lsp_semantic_tokens",
+        "semantic highlighting tokens from the language server", {});
     reg.declare_option<CompletionList>("lsp_completions",
         "completion candidates from the language server", {});
     reg.declare_option<bool>("lsp_debug",
@@ -270,10 +297,12 @@ LSPManager::LSPManager()
     auto add_face = [&](StringView name, StringView desc) {
         try { faces.add_face(name, desc, false); } catch (runtime_error&) {}
     };
-    add_face("DiagnosticError", "red,default");
-    add_face("DiagnosticWarning", "yellow,default");
-    add_face("DiagnosticInfo", "blue,default");
-    add_face("DiagnosticHint", "cyan,default");
+    // Curly underline with a colored underline (3rd color), default fg/bg so the
+    // squiggle is drawn *over* syntax/semantic colors rather than replacing them.
+    add_face("DiagnosticError", "default,default,red+c");
+    add_face("DiagnosticWarning", "default,default,yellow+c");
+    add_face("DiagnosticInfo", "default,default,blue+c");
+    add_face("DiagnosticHint", "default,default,cyan+c");
 
     auto& cm = CommandManager::instance();
     // Commands may fire from hooks during shutdown (e.g. BufClose while the
@@ -292,6 +321,7 @@ LSPManager::LSPManager()
     cmd("lsp-definition", "jump to the definition of the symbol under the cursor", &LSPManager::definition);
     cmd("lsp-hover", "show information about the symbol under the cursor", &LSPManager::hover);
     cmd("lsp-complete", "request completions at the cursor from the language server", &LSPManager::complete);
+    cmd("lsp-semantic-tokens", "request semantic highlighting tokens from the language server", &LSPManager::semantic_tokens);
 
     cm.register_command("lsp-did-close",
         [](const ParametersParser& parser, Context&, const ShellContext&) {
@@ -378,6 +408,26 @@ LSPManager::Server* LSPManager::ensure_server(Buffer& buffer, Context& spawn_ctx
         text_document.insert({"completion", jobj({})});
         text_document.insert({"publishDiagnostics", jobj({})});
         text_document.insert({"synchronization", jobj({})});
+        {
+            JsonArray types;
+            for (const char* t : {"namespace","type","class","enum","interface","struct",
+                    "typeParameter","parameter","variable","property","enumMember","event",
+                    "function","method","macro","keyword","modifier","comment","string",
+                    "number","regexp","operator","decorator"})
+                types.push_back(Value{String{t}});
+            JsonArray mods;
+            for (const char* m : {"declaration","definition","readonly","static","deprecated",
+                    "abstract","async","modification","documentation","defaultLibrary"})
+                mods.push_back(Value{String{m}});
+            JsonObject requests; requests.insert({"full", Value{true}});
+            JsonArray formats; formats.push_back(Value{String{"relative"}});
+            JsonObject st;
+            st.insert({"requests", jobj(std::move(requests))});
+            st.insert({"tokenTypes", Value{std::move(types)}});
+            st.insert({"tokenModifiers", Value{std::move(mods)}});
+            st.insert({"formats", Value{std::move(formats)}});
+            text_document.insert({"semanticTokens", jobj(std::move(st))});
+        }
     }
     JsonObject caps;
     caps.insert({"textDocument", jobj(std::move(text_document))});
@@ -400,6 +450,19 @@ LSPManager::Server* LSPManager::ensure_server(Buffer& buffer, Context& spawn_ctx
                 if (auto c = o.find("capabilities"_sv); c != o.end())
                     sp->capabilities = std::move(c->value);
             }
+            // Capture the server's semantic-tokens legend (token type names by index).
+            if (auto* prov = find_member(sp->capabilities, "semanticTokensProvider"_sv))
+                if (auto* legend = find_member(*prov, "legend"_sv))
+                {
+                    if (auto* types = find_member(*legend, "tokenTypes"_sv); types and types->is_a<JsonArray>())
+                        for (auto& t : types->as<JsonArray>())
+                            if (t.is_a<String>())
+                                sp->semantic_token_types.push_back(t.as<String>());
+                    if (auto* mods = find_member(*legend, "tokenModifiers"_sv); mods and mods->is_a<JsonArray>())
+                        for (auto& m : mods->as<JsonArray>())
+                            if (m.is_a<String>())
+                                sp->semantic_token_modifiers.push_back(m.as<String>());
+                }
             sp->initialized = true;
             sp->client->send_notification("initialized", "{}");
             for (auto& [method, p] : sp->queued)
@@ -733,6 +796,79 @@ void LSPManager::complete(Context& context)
         });
 }
 
+void LSPManager::semantic_tokens(Context& context)
+{
+    if (not context.has_buffer())
+        return;
+    Buffer& buffer = context.buffer();
+    Server* server = server_for_buffer(buffer);
+    if (not server or not server->initialized or server->semantic_token_types.empty())
+        return; // server doesn't support semantic tokens
+    send_did_change(*server, buffer);
+
+    String bufname = buffer.name();
+    Vector<String> legend = server->semantic_token_types;       // copy for the callback
+    Vector<String> mod_legend = server->semantic_token_modifiers;
+    JsonObject td;
+    td.insert({"uri", Value{path_to_uri(buffer.filename())}});
+    JsonObject params;
+    params.insert({"textDocument", jobj(std::move(td))});
+    server->client->send_request("textDocument/semanticTokens/full", to_json(jobj(std::move(params))),
+        [bufname, legend = std::move(legend), mod_legend = std::move(mod_legend)](Value result, Value error) {
+            if (error)
+                return;
+            const Value* data = find_member(result, "data"_sv);
+            if (not data or not data->is_a<JsonArray>())
+                return;
+            auto& arr = data->as<JsonArray>();
+            Buffer* buf = BufferManager::instance().get_buffer_ifp(bufname);
+            if (not buf)
+                return;
+
+            // data is a flat array of 5-tuples, each delta-encoded against the
+            // previous token: deltaLine, deltaStartChar, length, tokenType, modifiers.
+            Vector<RangeAndString, MemoryDomain::Options> ranges;
+            int line = 0, start = 0;
+            for (size_t i = 0; i + 5 <= arr.size(); i += 5)
+            {
+                if (not (arr[i].is_a<int>() and arr[i+1].is_a<int>() and
+                         arr[i+2].is_a<int>() and arr[i+3].is_a<int>()))
+                    continue;
+                int dline = arr[i].as<int>(), dstart = arr[i+1].as<int>();
+                int length = arr[i+2].as<int>(), type = arr[i+3].as<int>();
+                int mods = arr[i+4].is_a<int>() ? arr[i+4].as<int>() : 0;
+                if (dline != 0) { line += dline; start = dstart; }
+                else            { start += dstart; }
+                if (length <= 0 or type < 0 or (size_t)type >= legend.size())
+                    continue;
+                bool readonly = false, user_defined = false;
+                for (size_t j = 0; j < mod_legend.size(); ++j)
+                    if (mods & (1 << j))
+                    {
+                        if (mod_legend[j] == "readonly") readonly = true;
+                        else if (mod_legend[j] == "userDefined") user_defined = true;
+                    }
+                StringView face = semantic_face(legend[type], readonly, user_defined);
+                if (face.empty())
+                    continue;
+                if (line < 0 or LineCount{line} >= buf->line_count())
+                    continue;
+                StringView line_str = (*buf)[LineCount{line}];
+                ByteCount b = utf16_to_byte(line_str, start);
+                ByteCount e = utf16_to_byte(line_str, start + length);
+                if (e <= b)
+                    continue;
+                ranges.push_back({InclusiveBufferRange{{LineCount{line}, b},
+                                                       {LineCount{line}, e - 1}}, face.str()});
+            }
+
+            RangeAndStringList list;
+            list.prefix = buf->timestamp();
+            list.list = std::move(ranges);
+            buf->options().get_local_option("lsp_semantic_tokens").set<RangeAndStringList>(list);
+        });
+}
+
 void LSPManager::on_notification(Server& server, StringView method, const Value& params)
 {
     if (method == "textDocument/publishDiagnostics")
@@ -782,6 +918,9 @@ void LSPManager::publish_diagnostics(const Value& params)
                         : severity == 2 ? "DiagnosticWarning"
                         : severity == 3 ? "DiagnosticInfo"
                                         : "DiagnosticHint";
+        StringView gutter = severity == 1 ? "red"
+                          : severity == 2 ? "yellow"
+                          : severity == 3 ? "blue" : "cyan";
 
         BufferCoord b = coord_from_position(*buffer, *start);
         BufferCoord e = coord_from_position(*buffer, *end);
@@ -792,7 +931,7 @@ void LSPManager::publish_diagnostics(const Value& params)
         if (e < b)
             e = b;
         ranges.push_back({InclusiveBufferRange{b, e}, face.str()});
-        lines.push_back({b.line + 1, "{" + face + "}>"});
+        lines.push_back({b.line + 1, "{" + gutter + "}>"});
     }
 
     RangeAndStringList range_list;

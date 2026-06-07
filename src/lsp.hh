@@ -33,6 +33,7 @@ public:
     void definition(Context& context);
     void hover(Context& context);
     void complete(Context& context);
+    void semantic_tokens(Context& context);
     void did_close(StringView buffer_name);
     void exit_all();
 
@@ -52,6 +53,8 @@ private:
         UniquePtr<LSPClient> client;
         bool initialized = false;
         Value capabilities;
+        Vector<String> semantic_token_types;     // server's semanticTokens type legend (empty = unsupported)
+        Vector<String> semantic_token_modifiers; // server's semanticTokens modifier legend
         HashMap<String, DocState, MemoryDomain::Values> docs; // by buffer filename
         Vector<std::pair<String, String>> queued; // (method, params) until `initialized`
     };
