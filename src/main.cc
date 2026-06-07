@@ -16,6 +16,7 @@
 #include "insert_completer.hh"
 #include "json_ui.hh"
 #include "keymap_manager.hh"
+#include "lsp.hh"
 #include "terminal_ui.hh"
 #include "option_manager.hh"
 #include "option_types.hh"
@@ -714,6 +715,10 @@ int run_server(StringView session, StringView server_init,
     register_keymaps();
     register_commands();
     register_highlighters();
+
+    // Native LSP client: server-process only. Its constructor registers the
+    // lsp_* options, lsp-* commands, and the BufClose/KakEnd hooks.
+    LSPManager lsp_manager;
 
     global_scope.options()["debug"].set(debug_flags);
 

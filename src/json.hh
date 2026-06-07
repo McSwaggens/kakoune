@@ -14,7 +14,14 @@ using JsonObject = HashMap<String, Value>;
 
 String to_json(int i);
 String to_json(bool b);
+String to_json(double d);
 String to_json(StringView str);
+
+// Serialize an arbitrary Json Value tree. Constrained to exactly Value so that
+// String arguments keep resolving to to_json(StringView) rather than being
+// ambiguously convertible to Value through its implicit converting constructor.
+template<typename T> requires std::is_same_v<T, Value>
+String to_json(const T& value);
 
 template<typename T>
 String to_json(ArrayView<const T> array)
