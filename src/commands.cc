@@ -464,7 +464,11 @@ void edit(const ParametersParser& parser, Context& context, const ShellContext&)
     const bool scratch = (bool)parser.get_switch("scratch");
 
     if (parser.positional_count() == 0 and not force_reload and not scratch)
-        throw wrong_argument_count();
+    {
+        CommandManager::instance().execute_single_command(
+            {"browse-directory"}, context, {});
+        return;
+    }
 
     const bool no_hooks = context.hooks_disabled();
     const auto flags = (no_hooks ? Buffer::Flags::NoHooks : Buffer::Flags::None) |
@@ -499,6 +503,13 @@ void edit(const ParametersParser& parser, Context& context, const ShellContext&)
             buffer = open_fifo(name, *fifo, flags, (bool)parser.get_switch("scroll"));
         else if (not buffer)
         {
+            auto parsed_name = parse_filename(name);
+            if (is_directory(parsed_name))
+            {
+                CommandManager::instance().execute_single_command(
+                    {"browse-directory", parsed_name}, context, {});
+                return;
+            }
             buffer = parser.get_switch("existing") ? open_file_buffer(name, flags)
                                                    : open_or_create_file_buffer(name, flags);
             if (buffer->flags() & Buffer::Flags::New)

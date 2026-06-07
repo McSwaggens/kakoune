@@ -76,6 +76,7 @@ constexpr auto enum_desc(Meta::Type<WriteMethod>)
 String find_file(StringView filename, StringView buf_dir, ConstArrayView<String> paths);
 bool file_exists(StringView filename);
 bool regular_file_exists(StringView filename);
+bool is_directory(StringView filename);
 
 void list_files(StringView directory, FunctionRef<void (StringView, const struct stat&)> callback);
 

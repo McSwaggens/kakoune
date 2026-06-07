@@ -244,6 +244,12 @@ bool regular_file_exists(StringView filename)
            (st.st_mode & S_IFMT) == S_IFREG;
 }
 
+bool is_directory(StringView filename)
+{
+    struct stat st;
+    return stat(filename.zstr(), &st) == 0 and S_ISDIR(st.st_mode);
+}
+
 template<bool atomic>
 void write(int fd, StringView data)
 {
