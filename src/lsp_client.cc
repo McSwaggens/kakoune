@@ -32,12 +32,12 @@ String frame(StringView body)
     return "Content-Length: " + to_string(body.length()) + "\r\n\r\n" + body;
 }
 
+}
+
 bool lsp_debug_enabled()
 {
     try { return GlobalScope::instance().options()["lsp_debug"].get<bool>(); }
     catch (runtime_error&) { return false; }
-}
-
 }
 
 LSPClient::LSPClient(StringView cmdline, const Context& spawn_ctx,

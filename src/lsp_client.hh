@@ -14,6 +14,10 @@ namespace Kakoune
 
 class Context;
 
+// Whether to surface language-server traffic/stderr to the *debug* buffer
+// (reads the global lsp_debug option). Shared by the transport and the manager.
+bool lsp_debug_enabled();
+
 // A single language-server process speaking JSON-RPC 2.0 over its stdin/stdout
 // using the LSP base protocol framing (Content-Length headers). This class is a
 // pure transport: it knows nothing about Buffers, Contexts or editor state. All

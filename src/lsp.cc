@@ -31,15 +31,10 @@ using ServerCommandMap = HashMap<String, String, MemoryDomain::Options>;
 namespace
 {
 
-bool lsp_debug_enabled()
-{
-    try { return GlobalScope::instance().options()["lsp_debug"].get<bool>(); }
-    catch (runtime_error&) { return false; }
-}
-
 // Always written (errors and other things the user should see).
 void debug(StringView msg) { write_to_debug_buffer(format("lsp: {}", msg)); }
-// Verbose traffic/info; only written when the lsp_debug option is set.
+// Verbose traffic/info; only written when the lsp_debug option is set
+// (lsp_debug_enabled is shared with the transport, declared in lsp_client.hh).
 void trace(StringView msg) { if (lsp_debug_enabled()) write_to_debug_buffer(format("lsp: {}", msg)); }
 
 // ── URI <-> path ────────────────────────────────────────────────────────────
@@ -128,18 +123,13 @@ ByteCount utf16_to_byte(StringView line, int u16_target)
 
 // ── project root ────────────────────────────────────────────────────────────
 
-bool path_exists(StringView path)
-{
-    return access(String{path}.c_str(), F_OK) == 0;
-}
-
 String find_root(StringView filename)
 {
     auto [dir, name] = split_path(filename);
     String cur = real_path(dir.empty() ? StringView{"."} : dir);
     while (not cur.empty())
     {
-        if (path_exists(cur + "/.git") or path_exists(cur + "/compile_commands.json"))
+        if (file_exists(cur + "/.git") or file_exists(cur + "/compile_commands.json"))
             return cur;
         auto [parent, base] = split_path(cur);
         if (parent.empty() or parent == cur)
@@ -201,10 +191,7 @@ BufferCoord coord_from_position(Buffer& buffer, const Value& pos)
         line = it->value.as<int>();
     if (auto it = o.find("character"_sv); it != o.end() and it->value.is_a<int>())
         character = it->value.as<int>();
-    LineCount l{line};
-    if (l < 0) l = 0;
-    if (l >= buffer.line_count()) l = buffer.line_count() - 1;
-    if (l < 0) l = 0;
+    LineCount l = clamp(LineCount{line}, 0_line, buffer.line_count() - 1);
     StringView line_str = buffer[l];
     return buffer.clamp({l, utf16_to_byte(line_str, character)});
 }
@@ -226,6 +213,26 @@ const Value* find_member(const Value& v, StringView key)
     auto& o = v.as<JsonObject>();
     auto it = o.find(key);
     return it != o.end() ? &it->value : nullptr;
+}
+
+// Set a buffer-local option value (the LSP result options are all buffer-scoped).
+template<typename T>
+void set_buffer_option(Buffer& buffer, StringView name, const T& value)
+{
+    buffer.options().get_local_option(name).set<T>(value);
+}
+
+// Inline-range face + gutter-marker color for an LSP diagnostic severity.
+struct DiagnosticStyle { StringView face, gutter; };
+DiagnosticStyle diagnostic_style(int severity)
+{
+    switch (severity)
+    {
+        case 1:  return {"DiagnosticError",   "red"};
+        case 2:  return {"DiagnosticWarning", "yellow"};
+        case 3:  return {"DiagnosticInfo",    "blue"};
+        default: return {"DiagnosticHint",    "cyan"};
+    }
 }
 
 // Map an LSP semantic token (type + modifiers) to a face. Mirrors the user's
@@ -792,7 +799,7 @@ void LSPManager::complete(Context& context)
             Buffer* buf = BufferManager::instance().get_buffer_ifp(bufname);
             if (not buf)
                 return;
-            buf->options().get_local_option("lsp_completions").set<CompletionList>(completions);
+            set_buffer_option(*buf, "lsp_completions", completions);
         });
 }
 
@@ -807,14 +814,21 @@ void LSPManager::semantic_tokens(Context& context)
     send_did_change(*server, buffer);
 
     String bufname = buffer.name();
-    Vector<String> legend = server->semantic_token_types;       // copy for the callback
-    Vector<String> mod_legend = server->semantic_token_modifiers;
+    Vector<String> legend = server->semantic_token_types; // copy for the callback
+    // Resolve the bit positions of the only two modifiers we map, so the decode
+    // loop does cheap bit tests instead of per-token string comparisons.
+    int readonly_bit = -1, userdef_bit = -1;
+    for (int j = 0; j < (int)server->semantic_token_modifiers.size(); ++j)
+    {
+        if (server->semantic_token_modifiers[j] == "readonly") readonly_bit = j;
+        else if (server->semantic_token_modifiers[j] == "userDefined") userdef_bit = j;
+    }
     JsonObject td;
     td.insert({"uri", Value{path_to_uri(buffer.filename())}});
     JsonObject params;
     params.insert({"textDocument", jobj(std::move(td))});
     server->client->send_request("textDocument/semanticTokens/full", to_json(jobj(std::move(params))),
-        [bufname, legend = std::move(legend), mod_legend = std::move(mod_legend)](Value result, Value error) {
+        [bufname, legend = std::move(legend), readonly_bit, userdef_bit](Value result, Value error) {
             if (error)
                 return;
             const Value* data = find_member(result, "data"_sv);
@@ -841,13 +855,8 @@ void LSPManager::semantic_tokens(Context& context)
                 else            { start += dstart; }
                 if (length <= 0 or type < 0 or (size_t)type >= legend.size())
                     continue;
-                bool readonly = false, user_defined = false;
-                for (size_t j = 0; j < mod_legend.size(); ++j)
-                    if (mods & (1 << j))
-                    {
-                        if (mod_legend[j] == "readonly") readonly = true;
-                        else if (mod_legend[j] == "userDefined") user_defined = true;
-                    }
+                bool readonly = readonly_bit >= 0 and (mods & (1 << readonly_bit));
+                bool user_defined = userdef_bit >= 0 and (mods & (1 << userdef_bit));
                 StringView face = semantic_face(legend[type], readonly, user_defined);
                 if (face.empty())
                     continue;
@@ -865,7 +874,7 @@ void LSPManager::semantic_tokens(Context& context)
             RangeAndStringList list;
             list.prefix = buf->timestamp();
             list.list = std::move(ranges);
-            buf->options().get_local_option("lsp_semantic_tokens").set<RangeAndStringList>(list);
+            set_buffer_option(*buf, "lsp_semantic_tokens", list);
         });
 }
 
@@ -914,13 +923,7 @@ void LSPManager::publish_diagnostics(const Value& params)
         int severity = 1;
         if (auto* s = find_member(d, "severity"_sv); s and s->is_a<int>())
             severity = s->as<int>();
-        StringView face = severity == 1 ? "DiagnosticError"
-                        : severity == 2 ? "DiagnosticWarning"
-                        : severity == 3 ? "DiagnosticInfo"
-                                        : "DiagnosticHint";
-        StringView gutter = severity == 1 ? "red"
-                          : severity == 2 ? "yellow"
-                          : severity == 3 ? "blue" : "cyan";
+        auto [face, gutter] = diagnostic_style(severity);
 
         BufferCoord b = coord_from_position(*buffer, *start);
         BufferCoord e = coord_from_position(*buffer, *end);
@@ -937,12 +940,12 @@ void LSPManager::publish_diagnostics(const Value& params)
     RangeAndStringList range_list;
     range_list.prefix = buffer->timestamp();
     range_list.list = std::move(ranges);
-    buffer->options().get_local_option("lsp_diagnostic_ranges").set<RangeAndStringList>(range_list);
+    set_buffer_option(*buffer, "lsp_diagnostic_ranges", range_list);
 
     LineAndSpecList line_list;
     line_list.prefix = buffer->timestamp();
     line_list.list = std::move(lines);
-    buffer->options().get_local_option("lsp_diagnostic_lines").set<LineAndSpecList>(line_list);
+    set_buffer_option(*buffer, "lsp_diagnostic_lines", line_list);
 
     trace(format("published {} diagnostics for {}", range_list.list.size(), buffer->name()));
 }

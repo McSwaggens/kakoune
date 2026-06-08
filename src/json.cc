@@ -5,10 +5,12 @@
 #include "unit_tests.hh"
 #include "utils.hh"
 #include "ranges.hh"
+#include "utf8.hh"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
 #include <utility>
 
 namespace Kakoune
@@ -71,11 +73,12 @@ String to_json(const T& value)
         // nested Value-in-Value models and recurse forever.
         auto& array = value.template as<JsonArray>();
         String res = "[";
-        for (size_t i = 0; i < array.size(); ++i)
+        bool first = true;
+        for (auto&& elem : array)
         {
-            if (i != 0)
+            if (not std::exchange(first, false))
                 res += ", ";
-            res += to_json(array[i]);
+            res += to_json(elem);
         }
         res += "]";
         return res;
@@ -114,30 +117,6 @@ static int hex_digit(char c)
     if (c >= 'a' and c <= 'f') return c - 'a' + 10;
     if (c >= 'A' and c <= 'F') return c - 'A' + 10;
     return -1;
-}
-
-static void append_utf8(String& s, int cp)
-{
-    if (cp < 0x80)
-        s.push_back((char)cp);
-    else if (cp < 0x800)
-    {
-        s.push_back((char)(0xC0 | (cp >> 6)));
-        s.push_back((char)(0x80 | (cp & 0x3F)));
-    }
-    else if (cp < 0x10000)
-    {
-        s.push_back((char)(0xE0 | (cp >> 12)));
-        s.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
-        s.push_back((char)(0x80 | (cp & 0x3F)));
-    }
-    else
-    {
-        s.push_back((char)(0xF0 | (cp >> 18)));
-        s.push_back((char)(0x80 | ((cp >> 12) & 0x3F)));
-        s.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
-        s.push_back((char)(0x80 | (cp & 0x3F)));
-    }
 }
 
 static constexpr size_t max_parsing_depth = 100;
@@ -233,7 +212,7 @@ JsonResult parse_json_impl(const char* pos, const char* end, size_t depth)
                             pos += 6;
                         }
                     }
-                    append_utf8(value, cp);
+                    utf8::dump(std::back_inserter(value), (Codepoint)cp);
                     break;
                 }
                 default: value.push_back(*pos); break; // unknown escape: keep char
