@@ -11,6 +11,7 @@
 #include "file.hh"
 #include "highlighters.hh"   // RangeAndStringList, LineAndSpecList, InclusiveBufferRange
 #include "hook_manager.hh"
+#include "input_handler.hh"
 #include "insert_completer.hh" // CompletionList, CompletionCandidate
 #include "option_manager.hh"
 #include "parameters_parser.hh"
@@ -232,6 +233,12 @@ Buffer* find_or_open_buffer(StringView path)
     return open_or_create_file_buffer(path);
 }
 
+bool is_word_char(char c)
+{
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+           (c >= '0' and c <= '9') or c == '_';
+}
+
 Vector<StringView> split_lines(StringView text)
 {
     Vector<StringView> lines;
@@ -391,6 +398,7 @@ LSPManager::LSPManager()
             }, doc, ParameterDesc{});
     };
     cmd("lsp-start", "start a language server for the current buffer and open it", &LSPManager::start);
+    cmd("lsp-auto-start", "start a language server for the current buffer if one is configured", &LSPManager::auto_start);
     cmd("lsp-stop", "stop the language server handling the current buffer", &LSPManager::stop);
     cmd("lsp-sync", "send pending changes of the current buffer to its language server", &LSPManager::sync);
     cmd("lsp-definition", "jump to the definition of the symbol under the cursor", &LSPManager::definition);
@@ -398,14 +406,19 @@ LSPManager::LSPManager()
     cmd("lsp-complete", "request completions at the cursor from the language server", &LSPManager::complete);
     cmd("lsp-semantic-tokens", "request semantic highlighting tokens from the language server", &LSPManager::semantic_tokens);
     cmd("lsp-references", "list references to the symbol under the cursor", &LSPManager::references);
+    cmd("lsp-format", "format the current buffer with the language server", &LSPManager::formatting);
     cmd("lsp-code-actions", "show code actions available at the selection", &LSPManager::code_actions);
 
     cm.register_command("lsp-rename",
         [](const ParametersParser& parser, Context& context, const ShellContext&) {
-            if (LSPManager::has_instance() and parser.positional_count() > 0)
+            if (not LSPManager::has_instance())
+                return;
+            if (parser.positional_count() > 0)
                 LSPManager::instance().rename(context, parser[0]);
-        }, "rename the symbol under the cursor to the given name",
-        ParameterDesc{{}, ParameterDesc::Flags::None, 1, 1});
+            else
+                LSPManager::instance().rename_prompt(context);
+        }, "rename the symbol under the cursor (prompts for the new name if not given)",
+        ParameterDesc{{}, ParameterDesc::Flags::None, 0, 1});
 
     cm.register_command("lsp-apply-code-action",
         [](const ParametersParser& parser, Context& context, const ShellContext&) {
@@ -429,6 +442,13 @@ LSPManager::LSPManager()
 
     Context empty{Context::EmptyContextFlag{}};
     auto& hooks = GlobalScope::instance().hooks();
+    // Auto-start: spawn the configured server when a window appears for a
+    // buffer (filetype may already be set) or when its filetype changes.
+    // lsp-auto-start is silent when lsp_servers has no entry for the language.
+    hooks.add_hook(Hook::WinCreate, "lsp", HookFlags::None, Regex{".*"},
+                   "lsp-auto-start", empty);
+    hooks.add_hook(Hook::WinSetOption, "lsp", HookFlags::None, Regex{"filetype=.*"},
+                   "lsp-auto-start", empty);
     hooks.add_hook(Hook::BufClose, "lsp", HookFlags::None, Regex{".*"},
                    "lsp-did-close %val{hook_param}", empty);
     hooks.add_hook(Hook::KakEnd, "lsp", HookFlags::None, Regex{".*"},
@@ -511,6 +531,10 @@ LSPManager::Server* LSPManager::ensure_server(Buffer& buffer, Context& spawn_ctx
         text_document.insert({"completion", jobj({})});
         text_document.insert({"publishDiagnostics", jobj({})});
         text_document.insert({"synchronization", jobj({})});
+        text_document.insert({"references", jobj({})});
+        text_document.insert({"rename", jobj({})});
+        text_document.insert({"codeAction", jobj({})});
+        text_document.insert({"formatting", jobj({})});
         {
             JsonArray types;
             for (const char* t : {"namespace","type","class","enum","interface","struct",
@@ -646,6 +670,22 @@ void LSPManager::start(Context& context)
     }
 }
 
+void LSPManager::auto_start(Context& context)
+{
+    if (not context.has_buffer())
+        return;
+    Buffer& buffer = context.buffer();
+    if (not (buffer.flags() & Buffer::Flags::File) or buffer.filename().empty())
+        return;
+    String language = language_of(buffer);
+    if (language.empty())
+        return;
+    auto& servers = GlobalScope::instance().options()["lsp_servers"].get<ServerCommandMap>();
+    if (servers.find(language) == servers.end())
+        return; // no server configured for this language: stay quiet
+    start(context);
+}
+
 void LSPManager::stop(Context& context)
 {
     if (not context.has_buffer())
@@ -690,6 +730,8 @@ void LSPManager::did_close(StringView buffer_name)
         notify(*server, "textDocument/didClose", to_json(jobj(std::move(params))));
         server->docs.remove(it->key);
     }
+    if (auto it = m_diagnostics.find(filename); it != m_diagnostics.end())
+        m_diagnostics.remove(it->key);
 }
 
 void LSPManager::exit_all()
@@ -848,11 +890,7 @@ void LSPManager::complete(Context& context)
     // stock option= completer can rank candidates against the typed prefix.
     BufferCoord word_start = cursor;
     StringView line = cursor.line < buffer.line_count() ? buffer[cursor.line] : StringView{};
-    auto is_word = [](char c) {
-        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
-               (c >= '0' and c <= '9') or c == '_';
-    };
-    while (word_start.column > 0 and is_word(line[word_start.column - 1]))
+    while (word_start.column > 0 and is_word_char(line[word_start.column - 1]))
         word_start.column -= 1;
 
     String bufname = buffer.name();
@@ -1094,6 +1132,74 @@ void LSPManager::rename(Context& context, StringView new_name)
         });
 }
 
+void LSPManager::rename_prompt(Context& context)
+{
+    if (not context.has_buffer() or not context.has_client())
+        return;
+    Buffer& buffer = context.buffer();
+
+    // Prefill the prompt with the identifier under the cursor.
+    BufferCoord cursor = context.selections().main().cursor();
+    StringView line = cursor.line < buffer.line_count() ? buffer[cursor.line] : StringView{};
+    ByteCount b = cursor.column, e = cursor.column;
+    while (b > 0 and is_word_char(line[b - 1]))
+        b -= 1;
+    while (e < line.length() and is_word_char(line[e]))
+        e += 1;
+
+    context.input_handler().prompt(
+        "rename:", line.substr(b, e - b).str(), {}, context.faces()["Prompt"],
+        PromptFlags::None, '_', PromptCompleter{},
+        [](StringView name, PromptEvent event, Context& context) {
+            if (event != PromptEvent::Validate or name.empty())
+                return;
+            if (LSPManager::has_instance())
+                LSPManager::instance().rename(context, name);
+        });
+}
+
+void LSPManager::formatting(Context& context)
+{
+    if (not context.has_buffer())
+        return;
+    Buffer& buffer = context.buffer();
+    Server* server = server_for_buffer(buffer);
+    if (not server or not server->initialized)
+    {
+        debug("no initialized language server for this buffer (run lsp-start)");
+        return;
+    }
+    send_did_change(*server, buffer);
+
+    int tabstop = 8, indentwidth = 4;
+    try { tabstop = buffer.options()["tabstop"].get<int>(); } catch (runtime_error&) {}
+    try { indentwidth = buffer.options()["indentwidth"].get<int>(); } catch (runtime_error&) {}
+
+    JsonObject options;
+    // indentwidth 0 means indent with tabs, of width tabstop.
+    options.insert({"tabSize", Value{indentwidth > 0 ? indentwidth : tabstop}});
+    options.insert({"insertSpaces", Value{indentwidth > 0}});
+    JsonObject td;
+    td.insert({"uri", Value{path_to_uri(buffer.filename())}});
+    JsonObject params;
+    params.insert({"textDocument", jobj(std::move(td))});
+    params.insert({"options", jobj(std::move(options))});
+
+    String bufname = buffer.name();
+    server->client->send_request("textDocument/formatting", to_json(jobj(std::move(params))),
+        [bufname](Value result, Value error) {
+            if (error)
+            {
+                debug(format("formatting failed: {}", to_json(error)));
+                return;
+            }
+            if (not result.is_a<JsonArray>() or result.as<JsonArray>().empty())
+                return; // already formatted (or server has no formatter)
+            if (Buffer* buf = BufferManager::instance().get_buffer_ifp(bufname))
+                apply_text_edits(*buf, result.as<JsonArray>());
+        });
+}
+
 void LSPManager::code_actions(Context& context)
 {
     if (not context.has_buffer() or not context.has_client())
@@ -1115,8 +1221,15 @@ void LSPManager::code_actions(Context& context)
     range.insert({"end", position_value(buffer, hi)});
     JsonObject td;
     td.insert({"uri", Value{path_to_uri(buffer.filename())}});
+    // Pass the published diagnostics overlapping the selection, so the server
+    // offers their quick-fixes (e.g. clangd's "add missing include").
+    JsonArray diags;
+    if (auto it = m_diagnostics.find(buffer.filename()); it != m_diagnostics.end())
+        for (auto& d : it->value)
+            if (d.begin <= hi and lo <= d.end)
+                diags.push_back(parse_json(d.json).value);
     JsonObject ctx;
-    ctx.insert({"diagnostics", Value{JsonArray{}}});
+    ctx.insert({"diagnostics", Value{std::move(diags)}});
     JsonObject params;
     params.insert({"textDocument", jobj(std::move(td))});
     params.insert({"range", jobj(std::move(range))});
@@ -1223,6 +1336,7 @@ void LSPManager::publish_diagnostics(const Value& params)
 
     Vector<RangeAndString, MemoryDomain::Options> ranges;
     Vector<LineAndSpec, MemoryDomain::Options> lines;
+    Vector<StoredDiagnostic> stored;
     for (auto& d : diags->as<JsonArray>())
     {
         const Value* range = find_member(d, "range"_sv);
@@ -1240,6 +1354,7 @@ void LSPManager::publish_diagnostics(const Value& params)
 
         BufferCoord b = coord_from_position(*buffer, *start);
         BufferCoord e = coord_from_position(*buffer, *end);
+        stored.push_back({to_json(d), b, e});
         if (e.column > 0)
             e.column -= 1; // LSP end is exclusive; ranges option is inclusive
         else if (e.line > b.line)
@@ -1259,6 +1374,8 @@ void LSPManager::publish_diagnostics(const Value& params)
     line_list.prefix = buffer->timestamp();
     line_list.list = std::move(lines);
     set_buffer_option(*buffer, "lsp_diagnostic_lines", line_list);
+
+    m_diagnostics[path] = std::move(stored);
 
     trace(format("published {} diagnostics for {}", range_list.list.size(), buffer->name()));
 }

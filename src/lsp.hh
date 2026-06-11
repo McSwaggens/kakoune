@@ -28,6 +28,7 @@ public:
 
     // Command entry points (invoked from the registered :lsp-* commands).
     void start(Context& context);     // ensure a server for the buffer + didOpen
+    void auto_start(Context& context); // start() iff a server is configured; quiet otherwise
     void stop(Context& context);      // shutdown the buffer's server
     void sync(Context& context);      // flush pending didChange for the buffer
     void definition(Context& context);
@@ -36,6 +37,8 @@ public:
     void semantic_tokens(Context& context);
     void references(Context& context);
     void rename(Context& context, StringView new_name);
+    void rename_prompt(Context& context); // interactive rename, prefilled with the symbol
+    void formatting(Context& context);    // named to not shadow Kakoune::format()
     void code_actions(Context& context);
     void apply_code_action(Context& context, int index);
     void did_close(StringView buffer_name);
@@ -71,8 +74,17 @@ private:
     void publish_diagnostics(const Value& params);
     void notify(Server& server, StringView method, String params_json);
 
+    // A published diagnostic, kept so codeAction requests can pass the
+    // diagnostics overlapping the selection (quick-fixes need this context).
+    struct StoredDiagnostic
+    {
+        String json;            // the diagnostic, as the server sent it
+        BufferCoord begin, end; // parsed range (end exclusive, like LSP)
+    };
+
     Vector<UniquePtr<Server>> m_servers;
     Vector<Value> m_code_actions; // last code-action results, indexed by the menu
+    HashMap<String, Vector<StoredDiagnostic>> m_diagnostics; // by buffer filename
 };
 
 }
