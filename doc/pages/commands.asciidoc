@@ -350,6 +350,25 @@ but not really useful in that context.
     `evaluate-commands -draft`, it is invisible and only responds to
     an `execute-keys` command in the same context.
 
+*menu* [<switches>] <name1> <commands1> <name2> <commands2> ...::
+    display a menu of the given item names, and execute the commands
+    associated with the validated item. Item names are fuzzy-completed
+    as in other menus; validating text that matches no item is an error.
+
+    *-auto-single*:::
+        instantly validate if only one item is given, without
+        displaying the menu
+
+    *-select-cmds*:::
+        each item specifies a third argument, a command to execute
+        whenever the item is selected (before validation)
+
+    *-on-abort* <command>:::
+        command to execute if the menu is aborted
+
+    NOTE: Like *prompt*, the menu is displayed in the current client
+    context and the calling command does not wait for the selection.
+
 *on-key* <command>::
     wait for next key from user, then execute <command>, the key is
     available through the `key` value, accessible through `$kak_key`

@@ -1,0 +1,1 @@
+:menu -auto-single foo %{execute-keys ifoo<lt>esc<gt>}<ret>

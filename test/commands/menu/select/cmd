@@ -1,0 +1,1 @@
+:menu foo %{execute-keys ifoo<lt>esc<gt>} bar %{execute-keys ibar<lt>esc<gt>}<ret>bar<ret>

@@ -39,9 +39,6 @@ Examples:
 * the `tmux.kak` script provides with terminal splitting using the
   `tmux` multiplexer
 
-* the `ctags.kak` script provides with symbol lookups using the
-  `readtags` utility provided by some `ctags` implementations
-
 Naming convention
 -----------------
 

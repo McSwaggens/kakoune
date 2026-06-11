@@ -2373,6 +2373,93 @@ const CommandDesc prompt_cmd = {
     }
 };
 
+const CommandDesc menu_cmd = {
+    "menu",
+    nullptr,
+    "menu [<switches>] <name1> <commands1> <name2> <commands2>...: display a "
+    "menu and execute commands for the selected item",
+    ParameterDesc{
+        { { "auto-single", { {}, "instantly validate if only one item is available" } },
+          { "select-cmds", { {}, "each item specify an additional command to run when selected" } },
+          { "on-abort", { ArgCompleter{}, "command to execute whenever the menu is canceled" } },
+          { "markup", { {}, "ignored (deprecated)" } } },
+        ParameterDesc::Flags::SwitchesOnlyAtStart, 2
+    },
+    CommandFlags::None,
+    CommandHelper{},
+    CommandCompleter{},
+    [](const ParametersParser& parser, Context& context, const ShellContext& shell_context)
+    {
+        const bool select_cmds = (bool)parser.get_switch("select-cmds");
+        const size_t stride = select_cmds ? 3 : 2;
+        const size_t count = parser.positional_count();
+        if (count % stride != 0)
+            throw runtime_error{"wrong argument count"};
+
+        if (parser.get_switch("auto-single") and count == stride)
+        {
+            CommandManager::instance().execute(parser[1], context, shell_context);
+            return;
+        }
+
+        struct Item { String title, command, select_command; };
+        Vector<Item> items;
+        for (size_t i = 0; i < count; i += stride)
+            items.push_back({parser[i], parser[i+1],
+                             select_cmds ? parser[i+2] : String{}});
+
+        Vector<String> titles;
+        for (auto& item : items)
+            titles.push_back(item.title);
+
+        context.input_handler().prompt(
+            "", {}, {}, context.faces()["Prompt"], PromptFlags::None, '_',
+            [titles=std::move(titles)](const Context&, StringView prefix, ByteCount cursor_pos) {
+                return Completions{0, cursor_pos, complete(prefix, cursor_pos, titles),
+                                   Completions::Flags::Menu};
+            },
+            [items=std::move(items),
+             on_abort = parser.get_switch("on-abort").value_or("").str(),
+             sc = CapturedShellContext{shell_context}]
+            (StringView str, PromptEvent event, Context& context)
+            {
+                auto item = find_if(items, [&](const Item& i) { return i.title == str; });
+                StringView command;
+                switch (event)
+                {
+                    case PromptEvent::Validate:
+                        if (item == items.end())
+                        {
+                            context.print_status({format("no such item: '{}'", str),
+                                                  context.faces()["Error"]});
+                            return;
+                        }
+                        command = item->command;
+                        break;
+                    case PromptEvent::Change:
+                        if (item == items.end() or item->select_command.empty())
+                            return;
+                        command = item->select_command;
+                        break;
+                    case PromptEvent::Abort:
+                        if (on_abort.empty())
+                            return;
+                        command = on_abort;
+                        break;
+                }
+                try
+                {
+                    CommandManager::instance().execute(command, context, sc);
+                }
+                catch (Kakoune::runtime_error& error)
+                {
+                    context.print_status({error.what().str(), context.faces()["Error"]});
+                    context.hooks().run_hook(Hook::RuntimeError, error.what(), context);
+                }
+            });
+    }
+};
+
 const CommandDesc on_key_cmd = {
     "on-key",
     nullptr,
@@ -2861,6 +2948,7 @@ void register_commands()
     register_command(execute_keys_cmd);
     register_command(evaluate_commands_cmd);
     register_command(prompt_cmd);
+    register_command(menu_cmd);
     register_command(on_key_cmd);
     register_command(info_cmd);
     register_command(try_catch_cmd);
