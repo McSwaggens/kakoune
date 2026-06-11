@@ -343,8 +343,16 @@ void setup_lsp_window(Context& context)
     run("add-highlighter window/lsp_diagnostic_ranges ranges lsp_diagnostic_ranges");
     run("add-highlighter window/lsp_diagnostic_lines flag-lines Default lsp_diagnostic_lines");
     // Completion: the stock option= completer renders lsp_completions, which we
-    // fill asynchronously; refresh it on idle.
-    run("set-option -add window completers option=lsp_completions");
+    // fill asynchronously; refresh it on idle. Prepend it so it takes precedence
+    // over word completion — the first completer that yields candidates wins, so
+    // appended it would lose to word=all as soon as a word prefix is typed.
+    InsertCompleterDesc lsp_completer{InsertCompleterDesc::Option, "lsp_completions"_str};
+    auto completers = context.options()["completers"].get<InsertCompleterDescList>();
+    if (not contains(completers, lsp_completer))
+    {
+        completers.insert(completers.begin(), lsp_completer);
+        context.options().get_local_option("completers").set(completers);
+    }
     run("remove-hooks window lsp-completion");
     run("hook -group lsp-completion window InsertIdle .* lsp-complete");
     // Semantic highlighting: refresh when idle in normal mode / on reload.
