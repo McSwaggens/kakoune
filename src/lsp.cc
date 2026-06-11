@@ -341,7 +341,9 @@ void setup_lsp_window(Context& context)
     };
     run("add-highlighter window/lsp_semantic_tokens ranges lsp_semantic_tokens");
     run("add-highlighter window/lsp_diagnostic_ranges ranges lsp_diagnostic_ranges");
-    run("add-highlighter window/lsp_diagnostic_lines flag-lines Default lsp_diagnostic_lines");
+    // -min-width 1 keeps the gutter present even with no diagnostics, so the
+    // view does not shift sideways as errors appear and disappear while typing.
+    run("add-highlighter window/lsp_diagnostic_lines flag-lines -min-width 1 Default lsp_diagnostic_lines");
     // Completion: the stock option= completer renders lsp_completions, which we
     // fill asynchronously; refresh it on idle. Prepend it so it takes precedence
     // over word completion — the first completer that yields candidates wins, so

@@ -1314,22 +1314,27 @@ void option_list_postprocess(Vector<LineAndSpec, MemoryDomain::Options>& opt)
 }
 
 const HighlighterDesc flag_lines_desc = {
-    "Parameters: <face> <option name>\n"
-    "Display flags specified in the line-spec option <option name> with <face>",
+    "Parameters: [-min-width <columns>] <face> <option name>\n"
+    "Display flags specified in the line-spec option <option name> with <face>\n"
+    "-min-width always reserves at least the given number of columns,\n"
+    "so the gutter does not appear and disappear as flags come and go",
     {}
 };
 struct FlagLinesHighlighter : Highlighter
 {
-    FlagLinesHighlighter(String option_name, String default_face, bool after)
+    FlagLinesHighlighter(String option_name, String default_face, bool after,
+                         ColumnCount min_width)
         : Highlighter{HighlightPass::Move},
           m_option_name{std::move(option_name)},
           m_default_face{std::move(default_face)},
-          m_after(after) {}
+          m_after(after),
+          m_min_width(min_width) {}
 
     static UniquePtr<Highlighter> create(HighlighterParameters params, Highlighter*)
     {
         ParametersParser parser{params, {
-            {{"after", {{}, "display at line end" }}},
+            {{"after", {{}, "display at line end" }},
+             {"min-width", {ArgCompleter{}, "always reserve at least this many columns" }}},
             ParameterDesc::Flags::SwitchesOnlyAtStart, 2, 2
         }};
 
@@ -1339,7 +1344,12 @@ struct FlagLinesHighlighter : Highlighter
         // throw if wrong option type
         GlobalScope::instance().options()[option_name].get<LineAndSpecList>();
 
-        return make_unique_ptr<FlagLinesHighlighter>(option_name, default_face, (bool)parser.get_switch("after"));
+        ColumnCount min_width = 0;
+        if (auto width = parser.get_switch("min-width"))
+            min_width = str_to_int(*width);
+
+        return make_unique_ptr<FlagLinesHighlighter>(option_name, default_face,
+                                                     (bool)parser.get_switch("after"), min_width);
     }
 
 private:
@@ -1367,7 +1377,7 @@ private:
             return;
         }
 
-        ColumnCount width = 0;
+        ColumnCount width = m_after ? 0 : m_min_width;
         for (auto& l : display_lines)
              width = std::max(width, l.length());
         const DisplayAtom empty{String{' ', width}, def_face};
@@ -1413,7 +1423,7 @@ private:
         const auto& buffer = context.context.buffer();
         update_line_specs_ifn(buffer, line_flags);
 
-        ColumnCount width = 0;
+        ColumnCount width = m_min_width;
         try
         {
             for (auto& line : line_flags.list)
@@ -1431,6 +1441,7 @@ private:
     String m_option_name;
     String m_default_face;
     bool m_after;
+    ColumnCount m_min_width;
 };
 
 bool is_empty(const InclusiveBufferRange& range)

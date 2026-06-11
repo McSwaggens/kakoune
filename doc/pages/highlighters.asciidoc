@@ -155,9 +155,12 @@ git blame output or spelling mistakes.
 See <<options#types,`:doc options types`>> for the format of `line-specs`
 and `range-specs`.
 
-*flag-lines* <face> <option_name>::
+*flag-lines* [-min-width <columns>] <face> <option_name>::
     add columns in front of the buffer, and display the flags specified
     in `line-specs` option, using <face>.
+    The gutter is as wide as the widest flag, and absent when there are
+    no flags; *-min-width* always reserves at least the given number of
+    columns, avoiding horizontal shifts as flags come and go.
     In this example two words will be added in the gutter: a blue Foo at
     line 1 and a bold red/yellow Bar on line 3:
 
