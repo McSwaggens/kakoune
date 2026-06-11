@@ -919,9 +919,20 @@ void LSPManager::complete(Context& context)
             if (not items)
                 return;
 
-            CompletionList completions;
-            completions.prefix = format("{}.{}@{}", (int)word_start.line + 1,
-                                        (int)word_start.column + 1, timestamp);
+            // The menu entry is parsed as display-line markup; escape literal braces.
+            auto escape_markup = [](StringView s) {
+                String res;
+                for (char c : s)
+                {
+                    if (c == '{')
+                        res += '\\';
+                    res += c;
+                }
+                return res;
+            };
+
+            struct Entry { String text, label, type, doc; };
+            Vector<Entry> entries;
             for (auto& item : *items)
             {
                 const Value* label = find_member(item, "label"_sv);
@@ -930,8 +941,58 @@ void LSPManager::complete(Context& context)
                 const Value* insert = find_member(item, "insertText"_sv);
                 String text = (insert and insert->is_a<String>()) ? insert->as<String>()
                                                                   : label->as<String>();
+                String type, doc;
+                if (const Value* detail = find_member(item, "detail"_sv);
+                    detail and detail->is_a<String>() and not detail->as<String>().empty())
+                {
+                    doc = detail->as<String>();
+                    StringView first_line = doc;
+                    if (auto nl = std::find(doc.begin(), doc.end(), '\n'); nl != doc.end())
+                        first_line = StringView{doc.begin(), nl};
+                    type = first_line.str();
+                }
+                // documentation: string | MarkupContent{value}
+                if (const Value* docs = find_member(item, "documentation"_sv))
+                {
+                    StringView docs_text;
+                    if (docs->is_a<String>())
+                        docs_text = docs->as<String>();
+                    else if (auto* val = find_member(*docs, "value"_sv); val and val->is_a<String>())
+                        docs_text = val->as<String>();
+                    if (not docs_text.empty())
+                        doc += (doc.empty() ? "" : "\n\n") + docs_text;
+                }
+                entries.push_back({std::move(text), label->as<String>(),
+                                   std::move(type), std::move(doc)});
+            }
+
+            // Align the types into a column after the longest label (overlong
+            // labels keep their type after a single space rather than pushing
+            // the whole column further right).
+            constexpr CharCount max_align = 40;
+            CharCount label_width = 0;
+            for (auto& e : entries)
+                if (CharCount len = e.label.char_length(); len <= max_align)
+                    label_width = std::max(label_width, len);
+
+            CompletionList completions;
+            completions.prefix = format("{}.{}@{}", (int)word_start.line + 1,
+                                        (int)word_start.column + 1, timestamp);
+            for (auto& e : entries)
+            {
+                String menu = escape_markup(e.label);
+                if (not e.type.empty())
+                {
+                    CharCount len = e.label.char_length();
+                    menu += String{' ', len < label_width ? label_width - len + 1 : 1};
+                    menu += "{MenuInfo}" + escape_markup(e.type);
+                }
+                // Show the full detail/documentation in a panel docked to the
+                // menu while the item is selected.
+                String on_select = e.doc.empty() ?
+                    String{} : "info -style menu -- " + quote(e.doc);
                 completions.list.push_back(CompletionCandidate{
-                    std::move(text), String{}, label->as<String>()});
+                    std::move(e.text), std::move(on_select), std::move(menu)});
             }
             if (completions.list.empty())
                 return;
