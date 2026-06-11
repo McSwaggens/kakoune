@@ -195,6 +195,24 @@ set-option window my_range %val{timestamp} '1.1,1.3|red'
 add-highlighter window/ replace-ranges my_range
 --------------------------------------------------------
 
+*ghost-text* <option_name>::
+    use the data in the `range-specs` option of the given name to display
+    ghost text: the string part of each tuple is displayed at the start of
+    the range (use an empty `a.b+0` range), pushing the buffer text right
+    and down as if it were inserted, without modifying the buffer.
+    The string is used as-is (not interpreted as markup), may contain
+    newlines, and is rendered with the `GhostText` face. The cursor is
+    drawn on the first cell of ghost text anchored at its position, which
+    makes this highlighter suitable for inline completion previews.
+    Here, the word 'red' will be displayed between the buffer's 2nd and
+    3rd characters:
+
+--------------------------------------------------------
+declare-option range-specs my_ghost
+set-option window my_ghost %val{timestamp} '1.3+0|red'
+add-highlighter window/ ghost-text my_ghost
+--------------------------------------------------------
+
 == Highlighting Groups
 
 The *group* highlighter is a container for other highlighters. A subgroup

@@ -1,0 +1,4 @@
+ui_out '{ "jsonrpc": "2.0", "method": "set_ui_options", "params": [{}] }'
+ui_out '{ "jsonrpc": "2.0", "method": "draw", "params": [[[{ "face": { "fg": "black", "bg": "white", "underline": "default", "attributes": [] }, "contents": "a" }, { "face": { "fg": "default", "bg": "default", "underline": "default", "attributes": [] }, "contents": "b" }, { "face": { "fg": "default", "bg": "default", "underline": "default", "attributes": ["dim","italic"] }, "contents": "XY" }, { "face": { "fg": "default", "bg": "default", "underline": "default", "attributes": [] }, "contents": "cde\u000a" }]], { "line": 0, "column": 0 }, { "fg": "default", "bg": "default", "underline": "default", "attributes": [] }, { "fg": "blue", "bg": "default", "underline": "default", "attributes": [] }, 0] }'
+ui_out '{ "jsonrpc": "2.0", "method": "menu_hide", "params": [] }'
+ui_out '{ "jsonrpc": "2.0", "method": "info_hide", "params": [] }'

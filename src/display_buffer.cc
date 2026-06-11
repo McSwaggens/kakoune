@@ -209,7 +209,8 @@ void DisplayLine::optimize()
         auto& next = *next_it;
 
         const auto type = atom.type();
-        if (type == next.type() and atom.face == next.face)
+        if (type == next.type() and atom.face == next.face and
+            atom.m_ghost == next.m_ghost)
         {
             if (type == DisplayAtom::Text)
                 atom.m_text += next.m_text;

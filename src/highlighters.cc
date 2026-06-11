@@ -635,6 +635,9 @@ struct WrapHighlighter : Highlighter
         for (auto it = display_buffer.lines().begin();
              it != display_buffer.lines().end(); ++it)
         {
+            if (it->atoms().empty()) // multiline replacements can leave empty lines
+                continue;
+
             const ColumnCount indent = m_preserve_indent ?
                 zero_if_greater(line_indent(buffer, tabstop, it->range().begin.line), wrap_column) : 0_col;
             const ColumnCount prefix_len = std::max(marker_len, indent);
@@ -1217,11 +1220,30 @@ void highlight_selections(HighlightContext context, DisplayBuffer& display_buffe
         highlight_range(display_buffer, begin, end, false,
                         apply_face(sel_faces[primary ? 0 : 1]));
     }
+    auto first_ghost_atom = [&](BufferCoord coord) -> DisplayAtom* {
+        for (auto& line : display_buffer.lines())
+        {
+            auto& range = line.range();
+            if (range.begin > coord or coord > range.end)
+                continue;
+            for (auto& atom : line)
+                if (atom.has_buffer_range() and atom.is_ghost() and atom.begin() == coord)
+                    return &atom;
+        }
+        return nullptr;
+    };
     for (size_t i = 0; i < selections.size(); ++i)
     {
         auto& sel = selections[i];
         const BufferCoord coord = sel.cursor();
         const bool primary = (i == selections.main_index());
+        // ghost atoms have an empty buffer range that highlight_range skips;
+        // draw the cursor on the ghost's first cell instead of the real char
+        if (DisplayAtom* atom = first_ghost_atom(coord))
+        {
+            atom->face = merge_faces(atom->face, sel_faces[2 + (primary ? 0 : 1)]);
+            continue;
+        }
         const bool eol = buffer[coord.line].length() - 1 == coord.column;
         highlight_range(display_buffer, coord, buffer.char_next(coord), false,
                         apply_face(sel_faces[2 + (eol ? 2 : 0) + (primary ? 0 : 1)]));
@@ -1668,6 +1690,119 @@ private:
                 auto added_count = std::count(spec.begin(), spec.end(), '\n');
                 auto removed_count = last.line - range.first.line;
                 setup.line_count += removed_count - added_count;
+            }
+        }
+    }
+};
+
+const HighlighterDesc ghost_text_desc = {
+    "Parameters: <option name>\n"
+    "Display the strings from the range-specs option <option name> as ghost\n"
+    "text inserted at each range's start, pushing the buffer text right and\n"
+    "down without modifying the buffer. The text is raw (not a markup string),\n"
+    "may contain newlines, and is rendered with the GhostText face",
+    {}
+};
+struct GhostTextHighlighter : OptionBasedHighlighter<RangeAndStringList, GhostTextHighlighter, HighlightPass::Replace>
+{
+    using GhostTextHighlighter::OptionBasedHighlighter::OptionBasedHighlighter;
+private:
+    static bool is_valid(Buffer& buffer, BufferCoord c)
+    {
+        return c.line >= 0 and c.column >= 0 and c.line < buffer.line_count() and c.column <= buffer[c.line].length();
+    }
+
+    // ghost atoms bypass the tabulations/unprintable highlighters (they skip
+    // non-Range atoms), so the text must be made displayable up front
+    static String sanitize(StringView text, ColumnCount tabstop)
+    {
+        String res;
+        for (auto it = text.begin(); it != text.end(); )
+        {
+            const auto cp_begin = it;
+            const Codepoint cp = utf8::read_codepoint(it, text.end());
+            if (cp == '\t')
+                res += String{' ', tabstop};
+            else if (cp < 0x20 or cp == 0x7F)
+                res += "�";
+            else
+                res += StringView{cp_begin, it};
+        }
+        return res;
+    }
+
+    void do_highlight(HighlightContext context, DisplayBuffer& display_buffer, BufferRange) override
+    {
+        auto& buffer = context.context.buffer();
+        auto& range_and_faces = get_option(context);
+        update_ranges(buffer, range_and_faces.prefix, range_and_faces.list);
+        range_and_faces.prefix = buffer.timestamp();
+        const Face face = context.context.faces()["GhostText"];
+        const ColumnCount tabstop = context.context.options()["tabstop"].get<int>();
+
+        for (auto& [range, spec] : range_and_faces.list)
+        {
+            try
+            {
+                if (not is_empty(range) or not is_valid(buffer, range.first))
+                    continue;
+                const BufferCoord anchor = range.first;
+                replace_range(display_buffer, anchor, anchor,
+                              [&](DisplayLineList& lines, DisplayLineList::iterator line, DisplayLine::iterator pos) {
+                                  auto emit = [&](StringView text) {
+                                      pos = ++line->insert(pos, {buffer, {anchor, anchor}, String{text}, face, true});
+                                  };
+                                  bool has_cursor_cell = false;
+                                  auto it = spec.begin(), eol = find(spec, '\n');
+                                  while (true)
+                                  {
+                                      const String text = sanitize({it, eol}, tabstop);
+                                      if (not text.empty())
+                                      {
+                                          if (not has_cursor_cell)
+                                          {
+                                              // the first codepoint gets its own atom so the cursor
+                                              // face can be drawn on a single cell
+                                              auto first_end = utf8::next(text.begin(), text.end());
+                                              emit({text.begin(), first_end});
+                                              if (first_end != text.end())
+                                                  emit({first_end, text.end()});
+                                              has_cursor_cell = true;
+                                          }
+                                          else
+                                              emit(text);
+                                      }
+                                      if (eol == spec.end())
+                                          break;
+                                      auto remaining = line->extract(pos, line->end());
+                                      line = lines.insert(++line, remaining);
+                                      pos = line->begin();
+                                      it = ++eol;
+                                      eol = std::find(it, spec.end(), '\n');
+                                  }
+                              });
+            }
+            catch (runtime_error&)
+            {}
+        }
+    }
+
+    void do_compute_display_setup(HighlightContext context, DisplaySetup& setup) const override
+    {
+        auto& buffer = context.context.buffer();
+        auto& range_and_faces = get_option(context);
+        update_ranges(buffer, range_and_faces.prefix, range_and_faces.list);
+        range_and_faces.prefix = buffer.timestamp();
+
+        for (auto& [range, spec] : range_and_faces.list)
+        {
+            if (not is_empty(range) or not is_valid(buffer, range.first))
+                continue;
+            if (range.first.line >= setup.first_line and
+                range.first.line <= setup.first_line + setup.line_count)
+            {
+                const LineCount added{(int)std::count(spec.begin(), spec.end(), '\n')};
+                setup.line_count -= std::min(setup.line_count - 1, added);
             }
         }
     }
@@ -2453,6 +2588,9 @@ void register_highlighters()
     registry.insert({
         "flag-lines",
         { FlagLinesHighlighter::create, &flag_lines_desc } });
+    registry.insert({
+        "ghost-text",
+        { GhostTextHighlighter::create, &ghost_text_desc } });
     registry.insert({
         "group",
         { create_highlighter_group, &higlighter_group_desc } });

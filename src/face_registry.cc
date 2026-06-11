@@ -207,6 +207,7 @@ FaceRegistry::FaceRegistry()
         { "BufferPadding", {Face{ Color::Blue, Color::Default }} },
         { "Whitespace", {Face{ Color::Default, Color::Default, Attribute::FinalFg }} },
         { "WhitespaceIndent", {Face{}, "Whitespace"} },
+        { "GhostText", {Face{ Color::Default, Color::Default, Attribute::Dim | Attribute::Italic }} },
       }
 {}
 

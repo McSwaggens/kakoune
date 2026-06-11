@@ -28,8 +28,8 @@ public:
     DisplayAtom(const Buffer& buffer, BufferRange range, Face face = {})
         : face(face), m_type(Range), m_buffer(&buffer), m_range{range} {}
 
-    DisplayAtom(const Buffer& buffer, BufferRange range, String str, Face face = {})
-        : face(face), m_type(ReplacedRange), m_buffer(&buffer), m_range{range}, m_text{std::move(str)} {}
+    DisplayAtom(const Buffer& buffer, BufferRange range, String str, Face face = {}, bool ghost = false)
+        : face(face), m_type(ReplacedRange), m_buffer(&buffer), m_range{range}, m_text{std::move(str)}, m_ghost{ghost} {}
 
     DisplayAtom(String str, Face face)
         : face(face), m_type(Text), m_text(std::move(str)) {}
@@ -76,13 +76,17 @@ public:
 
     Type type() const { return m_type; }
 
+    // Ghost atoms are display-only text anchored at an empty buffer range;
+    // the cursor anchors at their begin coord instead of after them
+    bool is_ghost() const { return m_ghost; }
+
     ColumnCount trim_begin(ColumnCount count);
     ColumnCount trim_end_to_length(ColumnCount count);
 
     bool operator==(const DisplayAtom& other) const
     {
         return face == other.face and type() == other.type() and
-               content() == other.content();
+               content() == other.content() and m_ghost == other.m_ghost;
     }
 
     Face face;
@@ -95,6 +99,7 @@ private:
     const Buffer* m_buffer = nullptr;
     BufferRange m_range;
     String m_text;
+    bool m_ghost = false;
 };
 
 using AtomList = Vector<DisplayAtom, MemoryDomain::Display>;

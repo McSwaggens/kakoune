@@ -151,6 +151,9 @@ the user interface:
 The following faces are used by built-in highlighters if enabled.
 (See <<highlighters#,`:doc highlighters`>>).
 
+*GhostText*::
+    Face used by the *ghost-text* highlighter.
+
 *LineNumbers*::
     Face used by the *number-lines* highlighter.
 

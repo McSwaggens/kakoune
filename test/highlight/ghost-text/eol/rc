@@ -1,0 +1,2 @@
+declare-option range-specs g %val{timestamp} '1.4+0|XY'
+add-highlighter window/ ghost-text g

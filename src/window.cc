@@ -253,23 +253,31 @@ DisplaySetup Window::compute_display_setup(const Context& context) const
 
 namespace
 {
-ColumnCount find_display_column(const DisplayLine& line, const Buffer& buffer,
-                                BufferCoord coord)
+Optional<ColumnCount> find_display_column(const DisplayLine& line, const Buffer& buffer,
+                                          BufferCoord coord)
 {
     ColumnCount column = 0;
     for (auto& atom : line)
     {
-        if (atom.has_buffer_range() and
-            coord >= atom.begin() and coord < atom.end())
+        if (atom.has_buffer_range())
         {
-            if (atom.type() == DisplayAtom::Range)
-                column += utf8::column_distance(get_iterator(buffer, atom.begin()),
-                                                get_iterator(buffer, coord));
-            return column;
+            // the coord anchors at the start of ghost text, not after it
+            if (atom.is_ghost() and atom.begin() == coord)
+                return column;
+            if (coord >= atom.begin() and coord < atom.end())
+            {
+                if (atom.type() == DisplayAtom::Range)
+                    column += utf8::column_distance(get_iterator(buffer, atom.begin()),
+                                                    get_iterator(buffer, coord));
+                return column;
+            }
         }
         column += atom.length();
     }
-    return column;
+    auto& range = line.range();
+    if (range.begin <= coord and coord < range.end)
+        return column;
+    return {};
 }
 
 BufferCoord find_buffer_coord(const DisplayLine& line, const Buffer& buffer,
@@ -304,8 +312,12 @@ Optional<DisplayCoord> Window::display_coord(BufferCoord coord) const
     for (auto& line : m_display_buffer.lines())
     {
         auto& range = line.range();
-        if (range.begin <= coord and coord < range.end)
-            return DisplayCoord{l, find_display_column(line, buffer(), coord)};
+        // inclusive end: a line ending in ghost text at coord has range.end == coord
+        if (range.begin <= coord and coord <= range.end)
+        {
+            if (auto column = find_display_column(line, buffer(), coord))
+                return DisplayCoord{l, *column};
+        }
         ++l;
     }
     return {};

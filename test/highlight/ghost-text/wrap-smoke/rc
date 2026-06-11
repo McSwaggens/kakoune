@@ -1,0 +1,4 @@
+add-highlighter window/ wrap
+declare-option range-specs g %val{timestamp} '1.1+0|
+after-newline' '2.3+0|0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789'
+add-highlighter window/ ghost-text g
