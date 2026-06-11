@@ -32,11 +32,15 @@ public:
     // move-only, so they cannot be copied out of a const reference.
     using ResponseCallback = Function<void (Value result, Value error)>;
     using NotificationHandler = Function<void (StringView method, Value params)>;
+    // Handles a server->client request, returning the result to send back
+    // (an empty Value becomes a null result). Used e.g. for workspace/applyEdit.
+    using RequestHandler = Function<Value (StringView method, const Value& params)>;
 
     // Spawns `cmdline` (through the user's shell) and wires its pipes into the
     // event loop. spawn_ctx is only used during construction (for ShellManager)
     // and is not retained.
-    LSPClient(StringView cmdline, const Context& spawn_ctx, NotificationHandler on_notification);
+    LSPClient(StringView cmdline, const Context& spawn_ctx,
+              NotificationHandler on_notification, RequestHandler on_request);
     ~LSPClient();
 
     LSPClient(const LSPClient&) = delete;
@@ -56,7 +60,6 @@ private:
     void on_writable();
     void drain_messages();
     void dispatch(Value message);
-    void reply_null(const Value& id);
     void queue_write(String framed);
     void mark_dead();
     void log(StringView what);
@@ -71,6 +74,7 @@ private:
     int m_next_id = 1;
     HashMap<int, ResponseCallback> m_pending;
     NotificationHandler m_on_notification;
+    RequestHandler m_on_request;
     bool m_dead = false;
 
     // Declared last so they are destroyed (unregistered from the EventManager)

@@ -34,6 +34,10 @@ public:
     void hover(Context& context);
     void complete(Context& context);
     void semantic_tokens(Context& context);
+    void references(Context& context);
+    void rename(Context& context, StringView new_name);
+    void code_actions(Context& context);
+    void apply_code_action(Context& context, int index);
     void did_close(StringView buffer_name);
     void exit_all();
 
@@ -68,6 +72,7 @@ private:
     void notify(Server& server, StringView method, String params_json);
 
     Vector<UniquePtr<Server>> m_servers;
+    Vector<Value> m_code_actions; // last code-action results, indexed by the menu
 };
 
 }

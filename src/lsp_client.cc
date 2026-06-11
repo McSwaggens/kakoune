@@ -41,9 +41,10 @@ bool lsp_debug_enabled()
 }
 
 LSPClient::LSPClient(StringView cmdline, const Context& spawn_ctx,
-                     NotificationHandler on_notification)
+                     NotificationHandler on_notification, RequestHandler on_request)
     : m_shell{ShellManager::instance().spawn(cmdline, spawn_ctx, true)},
-      m_on_notification{std::move(on_notification)}
+      m_on_notification{std::move(on_notification)},
+      m_on_request{std::move(on_request)}
 {
     // stdin is written non-blocking and drained by the event loop.
     int in_fd = (int)m_shell.in;
@@ -222,15 +223,16 @@ void LSPClient::dispatch(Value message)
             params = std::move(it->value);
 
         if (has_id)
-            reply_null(id_it->value); // server->client request: M1 acks with null
+        {
+            // server->client request: let the handler produce a result (e.g.
+            // workspace/applyEdit), otherwise ack with null.
+            Value result = m_on_request ? m_on_request(method, params) : Value{};
+            queue_write(frame("{\"jsonrpc\":\"2.0\",\"id\":" + to_json(id_it->value) +
+                              ",\"result\":" + to_json(result) + "}"));
+        }
         else
             m_on_notification(method, std::move(params));
     }
-}
-
-void LSPClient::reply_null(const Value& id)
-{
-    queue_write(frame("{\"jsonrpc\":\"2.0\",\"id\":" + to_json(id) + ",\"result\":null}"));
 }
 
 int LSPClient::send_request(StringView method, String params_json, ResponseCallback cb)

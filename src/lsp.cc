@@ -21,6 +21,7 @@
 #include "user_interface.hh" // InfoStyle
 #include "utf8.hh"
 
+#include <algorithm>
 #include <unistd.h>
 
 namespace Kakoune
@@ -222,6 +223,73 @@ void set_buffer_option(Buffer& buffer, StringView name, const T& value)
     buffer.options().get_local_option(name).set<T>(value);
 }
 
+// The buffer for a path: an already-open one if present, else open/create it.
+Buffer* find_or_open_buffer(StringView path)
+{
+    for (auto& b : BufferManager::instance())
+        if (b->filename() == path)
+            return b.get();
+    return open_or_create_file_buffer(path);
+}
+
+Vector<StringView> split_lines(StringView text)
+{
+    Vector<StringView> lines;
+    const char* start = text.begin();
+    for (const char* p = text.begin(); p != text.end(); ++p)
+        if (*p == '\n') { lines.push_back({start, p}); start = p + 1; }
+    lines.push_back({start, text.end()});
+    return lines;
+}
+
+// Apply an array of LSP TextEdits to a buffer. Edits are applied last-first so
+// earlier ranges keep their coordinates (LSP guarantees they don't overlap).
+void apply_text_edits(Buffer& buffer, const JsonArray& edits)
+{
+    struct Edit { BufferCoord begin, end; String text; };
+    Vector<Edit> list;
+    for (auto& e : edits)
+    {
+        const Value* range = find_member(e, "range"_sv);
+        const Value* new_text = find_member(e, "newText"_sv);
+        if (not range or not new_text or not new_text->is_a<String>())
+            continue;
+        const Value* s = find_member(*range, "start"_sv);
+        const Value* en = find_member(*range, "end"_sv);
+        if (not s or not en)
+            continue;
+        list.push_back({coord_from_position(buffer, *s),
+                        coord_from_position(buffer, *en), new_text->as<String>()});
+    }
+    std::sort(list.begin(), list.end(),
+              [](const Edit& a, const Edit& b) { return b.begin < a.begin; });
+    for (auto& e : list)
+        if (e.begin <= e.end)
+            buffer.replace(e.begin, e.end, e.text); // LSP end is exclusive, like replace()
+}
+
+// Apply an LSP WorkspaceEdit (changes / documentChanges) to the affected buffers.
+void apply_workspace_edit(const Value& edit)
+{
+    if (not edit.is_a<JsonObject>())
+        return;
+    if (const Value* changes = find_member(edit, "changes"_sv); changes and changes->is_a<JsonObject>())
+        for (auto& item : changes->as<JsonObject>())
+            if (item.value.is_a<JsonArray>())
+                if (Buffer* buf = find_or_open_buffer(uri_to_path(item.key)))
+                    apply_text_edits(*buf, item.value.as<JsonArray>());
+    if (const Value* dchanges = find_member(edit, "documentChanges"_sv); dchanges and dchanges->is_a<JsonArray>())
+        for (auto& dc : dchanges->as<JsonArray>())
+        {
+            const Value* td = find_member(dc, "textDocument"_sv);
+            const Value* edits = find_member(dc, "edits"_sv);
+            const Value* uri = td ? find_member(*td, "uri"_sv) : nullptr;
+            if (uri and uri->is_a<String>() and edits and edits->is_a<JsonArray>())
+                if (Buffer* buf = find_or_open_buffer(uri_to_path(uri->as<String>())))
+                    apply_text_edits(*buf, edits->as<JsonArray>());
+        }
+}
+
 // Inline-range face + gutter-marker color for an LSP diagnostic severity.
 struct DiagnosticStyle { StringView face, gutter; };
 DiagnosticStyle diagnostic_style(int severity)
@@ -329,6 +397,22 @@ LSPManager::LSPManager()
     cmd("lsp-hover", "show information about the symbol under the cursor", &LSPManager::hover);
     cmd("lsp-complete", "request completions at the cursor from the language server", &LSPManager::complete);
     cmd("lsp-semantic-tokens", "request semantic highlighting tokens from the language server", &LSPManager::semantic_tokens);
+    cmd("lsp-references", "list references to the symbol under the cursor", &LSPManager::references);
+    cmd("lsp-code-actions", "show code actions available at the selection", &LSPManager::code_actions);
+
+    cm.register_command("lsp-rename",
+        [](const ParametersParser& parser, Context& context, const ShellContext&) {
+            if (LSPManager::has_instance() and parser.positional_count() > 0)
+                LSPManager::instance().rename(context, parser[0]);
+        }, "rename the symbol under the cursor to the given name",
+        ParameterDesc{{}, ParameterDesc::Flags::None, 1, 1});
+
+    cm.register_command("lsp-apply-code-action",
+        [](const ParametersParser& parser, Context& context, const ShellContext&) {
+            if (LSPManager::has_instance() and parser.positional_count() > 0)
+                LSPManager::instance().apply_code_action(context, str_to_int(parser[0]));
+        }, "apply a code action by index (used by the lsp-code-actions menu)",
+        ParameterDesc{{}, ParameterDesc::Flags::None, 1, 1});
 
     cm.register_command("lsp-did-close",
         [](const ParametersParser& parser, Context&, const ShellContext&) {
@@ -396,6 +480,18 @@ LSPManager::Server* LSPManager::ensure_server(Buffer& buffer, Context& spawn_ctx
         srv->client = make_unique_ptr<LSPClient>(cmd_it->value, spawn_ctx,
             [this, sp](StringView method, Value params) {
                 on_notification(*sp, method, params);
+            },
+            [](StringView method, const Value& params) -> Value {
+                // Servers (e.g. clangd code-action tweaks) ask us to apply edits.
+                if (method == "workspace/applyEdit")
+                {
+                    if (const Value* edit = find_member(params, "edit"_sv))
+                        apply_workspace_edit(*edit);
+                    JsonObject res;
+                    res.insert({"applied", Value{true}});
+                    return jobj(std::move(res));
+                }
+                return {}; // ack other requests with null
             });
     }
     catch (runtime_error& err)
@@ -664,11 +760,7 @@ void LSPManager::definition(Context& context)
             String path = uri_to_path(uri->as<String>());
             try
             {
-                Buffer* target = nullptr;
-                for (auto& b : BufferManager::instance())
-                    if (b->filename() == path) { target = b.get(); break; }
-                if (not target)
-                    target = open_or_create_file_buffer(path);
+                Buffer* target = find_or_open_buffer(path);
                 if (not target)
                 {
                     debug(format("definition: could not open '{}'", path));
@@ -876,6 +968,227 @@ void LSPManager::semantic_tokens(Context& context)
             list.list = std::move(ranges);
             set_buffer_option(*buf, "lsp_semantic_tokens", list);
         });
+}
+
+void LSPManager::references(Context& context)
+{
+    if (not context.has_buffer())
+        return;
+    Buffer& buffer = context.buffer();
+    Server* server = server_for_buffer(buffer);
+    if (not server or not server->initialized)
+    {
+        debug("no initialized language server for this buffer (run lsp-start)");
+        return;
+    }
+    send_did_change(*server, buffer);
+
+    String client_name = context.name();
+    JsonObject td;
+    td.insert({"uri", Value{path_to_uri(buffer.filename())}});
+    JsonObject ctx;
+    ctx.insert({"includeDeclaration", Value{true}});
+    JsonObject params;
+    params.insert({"textDocument", jobj(std::move(td))});
+    params.insert({"position", position_value(buffer, context.selections().main().cursor())});
+    params.insert({"context", jobj(std::move(ctx))});
+    server->client->send_request("textDocument/references", to_json(jobj(std::move(params))),
+        [client_name](Value result, Value error) {
+            if (error)
+            {
+                debug(format("references failed: {}", to_json(error)));
+                return;
+            }
+            if (not result.is_a<JsonArray>() or result.as<JsonArray>().empty())
+            {
+                debug("no references found");
+                return;
+            }
+
+            // Collect (path, line, utf16-col), sorted by path then line.
+            struct Loc { String path; int line, col; };
+            Vector<Loc> locs;
+            for (auto& loc : result.as<JsonArray>())
+            {
+                const Value* uri = find_member(loc, "uri"_sv);
+                const Value* range = find_member(loc, "range"_sv);
+                const Value* start = range ? find_member(*range, "start"_sv) : nullptr;
+                if (not uri or not uri->is_a<String>() or not start)
+                    continue;
+                int line = 0, col = 0;
+                if (auto* l = find_member(*start, "line"_sv); l and l->is_a<int>()) line = l->as<int>();
+                if (auto* c = find_member(*start, "character"_sv); c and c->is_a<int>()) col = c->as<int>();
+                locs.push_back({uri_to_path(uri->as<String>()), line, col});
+            }
+            std::sort(locs.begin(), locs.end(), [](const Loc& a, const Loc& b) {
+                return a.path != b.path ? a.path < b.path : a.line < b.line;
+            });
+
+            // Build grep-style "path:line:col: text" output, reading each file once.
+            String content;
+            for (size_t i = 0; i < locs.size(); )
+            {
+                StringView path = locs[i].path;
+                Buffer* buf = nullptr;
+                for (auto& b : BufferManager::instance())
+                    if (b->filename() == path) { buf = b.get(); break; }
+                String file_text;
+                Vector<StringView> file_lines;
+                if (not buf)
+                    try { file_text = read_file(path); file_lines = split_lines(file_text); }
+                    catch (runtime_error&) {}
+                for (; i < locs.size() and locs[i].path == path; ++i)
+                {
+                    int line = locs[i].line;
+                    StringView text = buf ? (line >= 0 and LineCount{line} < buf->line_count() ? (*buf)[LineCount{line}] : StringView{})
+                                          : (line >= 0 and line < (int)file_lines.size() ? file_lines[line] : StringView{});
+                    while (not text.empty() and (text.back() == '\n' or text.back() == '\r'))
+                        text = text.substr(0_byte, text.length() - 1);
+                    ByteCount col = text.empty() ? ByteCount{locs[i].col} : utf16_to_byte(text, locs[i].col);
+                    content += format("{}:{}:{}: {}\n", path, line + 1, (int)col + 1, text);
+                }
+            }
+
+            Client* client = ClientManager::instance().get_client_ifp(client_name);
+            if (not client)
+                return;
+            Buffer* refs = BufferManager::instance().get_buffer_ifp("*references*");
+            if (refs)
+                refs->replace({0, 0}, refs->end_coord(), content);
+            else
+            {
+                refs = create_buffer_from_string("*references*", Buffer::Flags::NoUndo, content);
+                refs->options().get_local_option("filetype").set<String>("grep");
+            }
+            client->context().change_buffer(*refs);
+        });
+}
+
+void LSPManager::rename(Context& context, StringView new_name)
+{
+    if (not context.has_buffer() or new_name.empty())
+        return;
+    Buffer& buffer = context.buffer();
+    Server* server = server_for_buffer(buffer);
+    if (not server or not server->initialized)
+    {
+        debug("no initialized language server for this buffer (run lsp-start)");
+        return;
+    }
+    send_did_change(*server, buffer);
+
+    JsonObject td;
+    td.insert({"uri", Value{path_to_uri(buffer.filename())}});
+    JsonObject params;
+    params.insert({"textDocument", jobj(std::move(td))});
+    params.insert({"position", position_value(buffer, context.selections().main().cursor())});
+    params.insert({"newName", Value{new_name.str()}});
+    server->client->send_request("textDocument/rename", to_json(jobj(std::move(params))),
+        [](Value result, Value error) {
+            if (error)
+            {
+                debug(format("rename failed: {}", to_json(error)));
+                return;
+            }
+            apply_workspace_edit(result);
+        });
+}
+
+void LSPManager::code_actions(Context& context)
+{
+    if (not context.has_buffer() or not context.has_client())
+        return;
+    Buffer& buffer = context.buffer();
+    Server* server = server_for_buffer(buffer);
+    if (not server or not server->initialized)
+    {
+        debug("no initialized language server for this buffer (run lsp-start)");
+        return;
+    }
+    send_did_change(*server, buffer);
+
+    const Selection& sel = context.selections().main();
+    BufferCoord lo = std::min<BufferCoord>(sel.anchor(), sel.cursor());
+    BufferCoord hi = std::max<BufferCoord>(sel.anchor(), sel.cursor());
+    JsonObject range;
+    range.insert({"start", position_value(buffer, lo)});
+    range.insert({"end", position_value(buffer, hi)});
+    JsonObject td;
+    td.insert({"uri", Value{path_to_uri(buffer.filename())}});
+    JsonObject ctx;
+    ctx.insert({"diagnostics", Value{JsonArray{}}});
+    JsonObject params;
+    params.insert({"textDocument", jobj(std::move(td))});
+    params.insert({"range", jobj(std::move(range))});
+    params.insert({"context", jobj(std::move(ctx))});
+
+    String client_name = context.name();
+    server->client->send_request("textDocument/codeAction", to_json(jobj(std::move(params))),
+        [client_name](Value result, Value error) {
+            if (not LSPManager::has_instance())
+                return;
+            if (error or not result.is_a<JsonArray>() or result.as<JsonArray>().empty())
+            {
+                debug("no code actions available");
+                return;
+            }
+            Client* client = ClientManager::instance().get_client_ifp(client_name);
+            if (not client)
+                return;
+
+            auto& actions = result.as<JsonArray>();
+            auto& store = LSPManager::instance().m_code_actions;
+            store.clear();
+            String menu = "menu -auto-single";
+            for (auto& action : actions)
+            {
+                const Value* title = find_member(action, "title"_sv);
+                StringView label = title and title->is_a<String>() ? title->as<String>()
+                                 : action.is_a<String>() ? action.as<String>() : StringView{"(action)"};
+                menu += format(" {} {}", quote(label),
+                               quote(format("lsp-apply-code-action {}", store.size())));
+                store.push_back(std::move(action));
+            }
+            try { CommandManager::instance().execute(menu, client->context()); }
+            catch (runtime_error& err) { debug(format("code-action menu failed: {}", err.what())); }
+        });
+}
+
+void LSPManager::apply_code_action(Context& context, int index)
+{
+    if (index < 0 or index >= (int)m_code_actions.size())
+        return;
+    const Value& action = m_code_actions[index];
+    // CodeAction with an inline edit: apply it directly.
+    if (const Value* edit = find_member(action, "edit"_sv))
+        apply_workspace_edit(*edit);
+
+    // A command to run: action.command is a string (bare Command) or a Command
+    // object (CodeAction.command). Send it via workspace/executeCommand.
+    const Value* command = find_member(action, "command"_sv);
+    const Value* cmd_id = command;
+    const Value* args = find_member(action, "arguments"_sv);
+    if (command and command->is_a<JsonObject>())
+    {
+        cmd_id = find_member(*command, "command"_sv);
+        args = find_member(*command, "arguments"_sv);
+    }
+    if (not cmd_id or not cmd_id->is_a<String>() or not context.has_buffer())
+        return;
+    Server* server = server_for_buffer(context.buffer());
+    if (not server or not server->initialized)
+        return;
+    JsonObject params;
+    params.insert({"command", Value{cmd_id->as<String>()}});
+    if (args and args->is_a<JsonArray>())
+    {
+        JsonArray copy; // Value is move-only; deep-copy the args via a json round-trip
+        for (auto& a : args->as<JsonArray>())
+            copy.push_back(parse_json(to_json(a)).value);
+        params.insert({"arguments", Value{std::move(copy)}});
+    }
+    server->client->send_request("workspace/executeCommand", to_json(jobj(std::move(params))),
+                                 [](Value, Value){});
 }
 
 void LSPManager::on_notification(Server& server, StringView method, const Value& params)
