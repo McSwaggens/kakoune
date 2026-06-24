@@ -55,8 +55,14 @@ void update_forward(ConstArrayView<Buffer::Change> changes, RangeContainer& rang
             changes_tracker.update(*it++);
     };
 
+    // Empty ranges (last < {0,0}, e.g. ghost-text anchors) sort before any
+    // change; key them by their start so insertions still shift them like
+    // they shift a cursor.
     auto range_it = std::lower_bound(ranges.begin(), ranges.end(), changes.front(),
-                                     [](auto& range, const Buffer::Change& change) { return get_last(range) < change.begin; });
+                                     [](auto& range, const Buffer::Change& change) {
+                                         auto& last = get_last(range);
+                                         return (last < BufferCoord{0,0} ? get_first(range) : last) < change.begin;
+                                     });
     for (auto end = ranges.end(); range_it != end; ++range_it)
         update_range(changes_tracker, *range_it, advance_while_relevant);
 }
