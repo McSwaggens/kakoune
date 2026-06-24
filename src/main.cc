@@ -16,6 +16,7 @@
 #include "insert_completer.hh"
 #include "json_ui.hh"
 #include "keymap_manager.hh"
+#include "ai.hh"
 #include "fim.hh"
 #include "lsp.hh"
 #include "terminal_ui.hh"
@@ -724,6 +725,9 @@ int run_server(StringView session, StringView server_init,
     // Native AI fill-in-middle completion; same shape as the LSP manager and
     // inert until the fim_cmd option is set.
     FIMManager fim_manager;
+
+    // AI editing on selections (the :ai command); inert until invoked.
+    AIManager ai_manager;
 
     global_scope.options()["debug"].set(debug_flags);
 
