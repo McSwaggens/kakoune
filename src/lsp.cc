@@ -903,6 +903,35 @@ void LSPManager::complete(Context& context)
     while (word_start.column > 0 and is_word_char(line[word_start.column - 1]))
         word_start.column -= 1;
 
+    // Only auto-complete when there is something to complete against: an
+    // identifier prefix under the cursor, or a server trigger character (e.g.
+    // '.', '::') right before it. On a blank line or after whitespace this
+    // stays quiet, so the menu does not pop open while you are just indenting.
+    if (word_start.column == cursor.column)
+    {
+        bool after_trigger = false;
+        if (cursor.column > 0)
+        {
+            const char prev = line[cursor.column - 1];
+            const StringView prev_sv{&prev, &prev + 1};
+            const Value* prov = find_member(server->capabilities, "completionProvider"_sv);
+            const Value* trig = prov ? find_member(*prov, "triggerCharacters"_sv) : nullptr;
+            if (trig and trig->is_a<JsonArray>())
+            {
+                for (auto& t : trig->as<JsonArray>())
+                    if (t.is_a<String>() and t.as<String>() == prev_sv)
+                    {
+                        after_trigger = true;
+                        break;
+                    }
+            }
+            else // server didn't advertise any: the common member-access ones
+                after_trigger = (prev == '.' or prev == ':' or prev == '>');
+        }
+        if (not after_trigger)
+            return;
+    }
+
     String bufname = buffer.name();
     size_t timestamp = buffer.timestamp();
     String params = text_document_position_params(buffer, cursor);
