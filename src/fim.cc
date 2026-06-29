@@ -134,7 +134,7 @@ String build_http_post(StringView host, int port, StringView path, StringView bo
     return format("POST {} HTTP/1.1\r\n"
                   "Host: {}:{}\r\n"
                   "Content-Type: application/json\r\n"
-                  "Accept: application/json\r\n"
+                  "Accept: application/json, text/event-stream\r\n"
                   "Content-Length: {}\r\n"
                   "Connection: close\r\n"
                   "\r\n{}",
@@ -145,6 +145,14 @@ struct HttpResponse
 {
     int status;
     String body;
+};
+
+struct HttpResponseHead
+{
+    int status;
+    Optional<size_t> content_length;
+    bool chunked = false;
+    ByteCount body_begin;
 };
 
 bool iequal(StringView a, StringView b)
@@ -158,9 +166,25 @@ bool iequal(StringView a, StringView b)
     return true;
 }
 
-// Returns disengaged while more data is needed; throws on malformed input
-// (including input truncated at eof).
-Optional<HttpResponse> parse_http_response(StringView data, bool eof)
+size_t parse_chunk_size(StringView size_line)
+{
+    size_line = StringView{size_line.begin(), find(size_line, ';')}; // chunk extensions
+    if (size_line.empty())
+        throw runtime_error("malformed chunk size");
+    size_t len = 0;
+    for (char c : size_line)
+    {
+        int v = c >= '0' and c <= '9' ? c - '0'
+              : c >= 'a' and c <= 'f' ? c - 'a' + 10
+              : c >= 'A' and c <= 'F' ? c - 'A' + 10 : -1;
+        if (v < 0)
+            throw runtime_error("malformed chunk size");
+        len = len * 16 + (size_t)v;
+    }
+    return len;
+}
+
+Optional<HttpResponseHead> parse_http_response_head(StringView data, bool eof)
 {
     auto header_end = find_substr(data, "\r\n\r\n");
     if (not header_end)
@@ -170,7 +194,6 @@ Optional<HttpResponse> parse_http_response(StringView data, bool eof)
         return {};
     }
     StringView headers = data.substr(0_byte, *header_end);
-    StringView body = data.substr(*header_end + 4);
 
     auto status_eol = find_substr(headers, "\r\n");
     StringView status_line = headers.substr(0_byte, status_eol.value_or(headers.length()));
@@ -183,10 +206,9 @@ Optional<HttpResponse> parse_http_response(StringView data, bool eof)
     for (char c : code)
         if (c < '0' or c > '9')
             throw runtime_error("malformed http status code");
-    const int status = str_to_int(code);
 
-    Optional<size_t> content_length;
-    bool chunked = false;
+    HttpResponseHead head{str_to_int(code), {}, false, *header_end + 4};
+
     StringView remaining = status_eol ? headers.substr(*status_eol + 2) : StringView{};
     while (not remaining.empty())
     {
@@ -211,23 +233,35 @@ Optional<HttpResponse> parse_http_response(StringView data, bool eof)
                     throw runtime_error("malformed content-length");
                 len = len * 10 + (size_t)(c - '0');
             }
-            content_length = len;
+            head.content_length = len;
         }
         else if (iequal(name, "transfer-encoding") and find_substr(value, "chunked"))
-            chunked = true;
+            head.chunked = true;
     }
+    return head;
+}
 
-    if (content_length)
+// Returns disengaged while more data is needed; throws on malformed input
+// (including input truncated at eof).
+Optional<HttpResponse> parse_http_response(StringView data, bool eof)
+{
+    auto head = parse_http_response_head(data, eof);
+    if (not head)
+        return {};
+    StringView body = data.substr(head->body_begin);
+
+    if (head->content_length)
     {
-        if ((size_t)(int)body.length() < *content_length)
+        if ((size_t)(int)body.length() < *head->content_length)
         {
             if (eof)
                 throw runtime_error("truncated http body");
             return {};
         }
-        return HttpResponse{status, String{body.substr(0_byte, ByteCount{(int)*content_length})}};
+        return HttpResponse{head->status,
+                            String{body.substr(0_byte, ByteCount{(int)*head->content_length})}};
     }
-    if (chunked)
+    if (head->chunked)
     {
         String dechunked;
         while (true)
@@ -240,22 +274,10 @@ Optional<HttpResponse> parse_http_response(StringView data, bool eof)
                 return {};
             }
             StringView size_line{body.begin(), body.begin() + (int)*eol};
-            size_line = StringView{size_line.begin(), find(size_line, ';')}; // chunk extensions
-            if (size_line.empty())
-                throw runtime_error("malformed chunk size");
-            size_t len = 0;
-            for (char c : size_line)
-            {
-                int v = c >= '0' and c <= '9' ? c - '0'
-                      : c >= 'a' and c <= 'f' ? c - 'a' + 10
-                      : c >= 'A' and c <= 'F' ? c - 'A' + 10 : -1;
-                if (v < 0)
-                    throw runtime_error("malformed chunk size");
-                len = len * 16 + (size_t)v;
-            }
+            const size_t len = parse_chunk_size(size_line);
             body = body.substr(*eol + 2);
             if (len == 0)
-                return HttpResponse{status, std::move(dechunked)};
+                return HttpResponse{head->status, std::move(dechunked)};
             if ((size_t)(int)body.length() < len + 2) // data + trailing CRLF
             {
                 if (eof)
@@ -269,7 +291,83 @@ Optional<HttpResponse> parse_http_response(StringView data, bool eof)
     // No framing information: Connection: close, the body ends at EOF.
     if (not eof)
         return {};
-    return HttpResponse{status, String{body}};
+    return HttpResponse{head->status, String{body}};
+}
+
+struct SseDelimiter
+{
+    ByteCount pos;
+    ByteCount len;
+};
+
+Optional<SseDelimiter> find_sse_delimiter(StringView data)
+{
+    auto lf = find_substr(data, "\n\n");
+    auto crlf = find_substr(data, "\r\n\r\n");
+    if (crlf and (not lf or *crlf < *lf))
+        return SseDelimiter{*crlf, 4_byte};
+    if (lf)
+        return SseDelimiter{*lf, 2_byte};
+    return {};
+}
+
+Optional<String> pop_sse_event(String& buffer)
+{
+    auto delimiter = find_sse_delimiter(buffer);
+    if (not delimiter)
+        return {};
+
+    String event_string{StringView{buffer}.substr(0_byte, delimiter->pos)};
+    String rest{StringView{buffer}.substr(delimiter->pos + delimiter->len)};
+    StringView event = event_string;
+
+    String data;
+    while (not event.empty())
+    {
+        auto nl = find(event, '\n');
+        StringView line{event.begin(), nl};
+        if (not line.empty() and line[line.length() - 1] == '\r')
+            line = line.substr(0_byte, line.length() - 1);
+        event = nl == event.end() ? StringView{} : StringView{nl + 1, event.end()};
+
+        if (line.starts_with("data:"))
+        {
+            StringView value = line.substr(5_byte);
+            if (not value.empty() and value[0_byte] == ' ')
+                value = value.substr(1_byte);
+            if (not data.empty())
+                data += "\n";
+            data += value;
+        }
+    }
+    buffer = std::move(rest);
+    return data;
+}
+
+bool extract_sse_content(StringView event, String& content, bool& stop)
+{
+    if (event.empty())
+        return false;
+    if (event == "[DONE]")
+    {
+        stop = true;
+        return true;
+    }
+
+    try
+    {
+        Value json = parse_json(event).value;
+        if (const Value* stopped = find_member(json, "stop");
+            stopped and stopped->is_a<bool>() and stopped->as<bool>())
+            stop = true;
+        if (const Value* c = find_member(json, "content"); c and c->is_a<String>())
+            content += c->as<String>();
+        return true;
+    }
+    catch (runtime_error&)
+    {
+        return false;
+    }
 }
 
 } // anonymous namespace
@@ -283,9 +381,11 @@ class HttpRequest
 {
 public:
     using OnDone = Function<void (bool ok, int status, String body)>;
+    using OnData = Function<void (String data)>;
 
-    HttpRequest(const HttpUrl& url, String request, OnDone on_done)
-        : m_request{std::move(request)}, m_on_done{std::move(on_done)}
+    HttpRequest(const HttpUrl& url, String request, OnDone on_done, OnData on_data = {})
+        : m_request{std::move(request)}, m_on_done{std::move(on_done)},
+          m_on_data{std::move(on_data)}
     {
         const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0)
@@ -378,6 +478,15 @@ private:
         }
         try
         {
+            if (m_on_data)
+            {
+                if (process_stream_response(eof))
+                    return;
+                if (eof)
+                    finish(true, m_head ? m_head->status : 0, {});
+                return;
+            }
+
             // Engaged as soon as Content-Length is satisfied — no need to
             // wait for the server's FIN.
             if (auto response = parse_http_response(m_data, eof))
@@ -394,6 +503,103 @@ private:
         }
     }
 
+    bool process_stream_response(bool eof)
+    {
+        if (not m_head)
+        {
+            auto head = parse_http_response_head(m_data, eof);
+            if (not head)
+                return false;
+
+            if (head->status != 200)
+            {
+                if (auto response = parse_http_response(m_data, eof))
+                {
+                    finish(true, response->status, std::move(response->body));
+                    return true;
+                }
+                return false;
+            }
+
+            StringView body = StringView{m_data}.substr(head->body_begin);
+            m_data = String{body};
+            m_head = *head;
+        }
+
+        String body;
+        bool done = false;
+        if (m_head->chunked)
+            done = drain_chunked_stream(body, eof);
+        else
+            done = drain_raw_stream(body, eof);
+
+        if (not body.empty())
+            m_on_data(std::move(body));
+
+        if (done)
+        {
+            finish(true, m_head->status, {});
+            return true;
+        }
+        return false;
+    }
+
+    bool drain_raw_stream(String& body, bool eof)
+    {
+        if (m_head->content_length)
+        {
+            const size_t remaining = *m_head->content_length - m_body_received;
+            const size_t count = std::min(remaining, (size_t)(int)m_data.length());
+            if (count)
+            {
+                body += m_data.substr(0_byte, ByteCount{(int)count});
+                m_data = String{StringView{m_data}.substr(ByteCount{(int)count})};
+                m_body_received += count;
+            }
+            return m_body_received >= *m_head->content_length;
+        }
+
+        if (not m_data.empty())
+        {
+            body = std::move(m_data);
+            m_data = {};
+        }
+        return eof;
+    }
+
+    bool drain_chunked_stream(String& body, bool eof)
+    {
+        while (true)
+        {
+            if (not m_chunk_size)
+            {
+                auto eol = find_substr(m_data, "\r\n");
+                if (not eol)
+                {
+                    if (eof and not m_data.empty())
+                        throw runtime_error("truncated chunked body");
+                    return false;
+                }
+                StringView size_line{m_data.begin(), m_data.begin() + (int)*eol};
+                m_chunk_size = parse_chunk_size(size_line);
+                m_data = String{StringView{m_data}.substr(*eol + 2)};
+                if (*m_chunk_size == 0)
+                    return true;
+            }
+
+            if ((size_t)(int)m_data.length() < *m_chunk_size + 2)
+            {
+                if (eof)
+                    throw runtime_error("truncated chunked body");
+                return false;
+            }
+
+            body += m_data.substr(0_byte, ByteCount{(int)*m_chunk_size});
+            m_data = String{StringView{m_data}.substr(ByteCount{(int)*m_chunk_size + 2})};
+            m_chunk_size.reset();
+        }
+    }
+
     void finish(bool ok, int status, String body)
     {
         auto done = std::move(m_on_done); // survives destruction of *this
@@ -406,7 +612,11 @@ private:
     String m_request;
     int m_sent = 0;
     String m_data;
+    Optional<HttpResponseHead> m_head;
+    Optional<size_t> m_chunk_size;
+    size_t m_body_received = 0;
     OnDone m_on_done;
+    OnData m_on_data;
     Optional<FDWatcher> m_watcher;
 };
 
@@ -458,7 +668,8 @@ void drain_server_output(FDWatcher& watcher, String& buf, bool& exited)
 } // anonymous namespace
 
 FIMManager::FIMManager()
-    : m_retry_timer{TimePoint::max(), [this](Timer&) { retry(); }}
+    : m_retry_timer{TimePoint::max(), [this](Timer&) { retry(); }},
+      m_stream_timer{TimePoint::max(), [this](Timer&) { flush_stream(); }, EventMode::Urgent}
 {
     auto& reg = GlobalScope::instance().option_registry();
     reg.declare_option<String>("fim_cmd",
@@ -491,6 +702,8 @@ FIMManager::FIMManager()
     reg.declare_option<int>("fim_slot",
         "llama-server slot used for fim requests to keep prompt cache hot (-1 lets the server choose an idle slot)",
         0);
+    reg.declare_option<bool>("fim_stream",
+        "stream fim completions from llama-server and update ghost text as tokens arrive", true);
     reg.declare_option<bool>("fim_debug",
         "log fim http traffic and completion-server output to the *debug* buffer", false);
 
@@ -676,7 +889,8 @@ void FIMManager::send_infill(Buffer& buffer, BufferCoord cursor)
     const double temperature = options["fim_temperature"].get<double>();
     if (temperature >= 0)
         body.insert({"temperature", Value{temperature}});
-    body.insert({"stream", Value{false}});
+    const bool streamed = options["fim_stream"].get<bool>();
+    body.insert({"stream", Value{streamed}});
     body.insert({"cache_prompt", Value{true}});
     const int predict_timeout = options["fim_predict_timeout_ms"].get<int>();
     if (predict_timeout > 0)
@@ -707,16 +921,26 @@ void FIMManager::send_infill(Buffer& buffer, BufferCoord cursor)
     const size_t timestamp = buffer.timestamp();
     m_request.reset(); // cancel any in-flight request
     m_pending_request.reset();
+    m_stream.reset();
     const size_t generation = ++m_request_generation;
     try
     {
         m_request = make_unique_ptr<HttpRequest>(*url, std::move(request),
-            [generation, bufname, cursor, timestamp](bool ok, int status, String response_body) {
+            [generation, bufname, cursor, timestamp, streamed](bool ok, int status, String response_body) {
                 if (FIMManager::has_instance())
                     FIMManager::instance().request_finished(generation, bufname, cursor, timestamp,
-                                                            ok, status, std::move(response_body));
-            });
+                                                            streamed, ok, status,
+                                                            std::move(response_body));
+            },
+            streamed ? HttpRequest::OnData{
+                [generation, bufname, cursor, timestamp](String data) {
+                    if (FIMManager::has_instance())
+                        FIMManager::instance().stream_data(generation, bufname, cursor, timestamp,
+                                                           std::move(data));
+                }} : HttpRequest::OnData{});
         m_pending_request = PendingRequest{bufname, timestamp};
+        if (streamed)
+            m_stream = Stream{generation, bufname, cursor, timestamp, {}, {}};
         trace(format("requested completion at {}.{}", cursor.line + 1, cursor.column + 1));
     }
     catch (runtime_error& err)
@@ -728,7 +952,7 @@ void FIMManager::send_infill(Buffer& buffer, BufferCoord cursor)
 
 void FIMManager::request_finished(size_t generation, StringView bufname,
                                   BufferCoord anchor, size_t timestamp,
-                                  bool ok, int status, String body)
+                                  bool streamed, bool ok, int status, String body)
 {
     if (generation != m_request_generation)
         return; // a stale callback from a cancelled request
@@ -741,16 +965,26 @@ void FIMManager::request_finished(size_t generation, StringView bufname,
 
     if (not ok or status == 503) // connection failed, or the model is still loading
     {
+        m_stream.reset();
         schedule_retry(String{bufname}, anchor, timestamp);
         return;
     }
     if (status != 200)
     {
+        m_stream.reset();
         debug(format("completion server returned {}: {}", status,
                      StringView{body}.substr(0_byte, std::min(body.length(), 200_byte))));
         return;
     }
     m_retry_count = 0;
+
+    if (streamed)
+    {
+        flush_stream();
+        m_stream_timer.disable();
+        m_stream.reset();
+        return;
+    }
 
     String content;
     try
@@ -799,6 +1033,62 @@ void FIMManager::request_finished(size_t generation, StringView bufname,
     set_ghost(*buffer, {String{bufname}, anchor, std::move(content), timestamp});
 }
 
+void FIMManager::stream_data(size_t generation, StringView bufname,
+                             BufferCoord anchor, size_t timestamp, String data)
+{
+    if (generation != m_request_generation)
+        return;
+    if (not m_stream or m_stream->generation != generation
+        or m_stream->bufname != bufname or m_stream->anchor != anchor
+        or m_stream->timestamp != timestamp)
+        return;
+
+    m_stream->event_buffer += data;
+    while (auto event = pop_sse_event(m_stream->event_buffer))
+    {
+        String content;
+        bool stop = false;
+        if (extract_sse_content(*event, content, stop) and not content.empty())
+            m_stream->pending_text += content;
+        if (stop)
+            break;
+    }
+
+    if (not m_stream->pending_text.empty())
+        m_stream_timer.set_next_date(Clock::now());
+}
+
+void FIMManager::flush_stream()
+{
+    if (not m_stream or m_stream->pending_text.empty())
+        return;
+    if (m_stream->generation != m_request_generation)
+        return;
+
+    String text = std::move(m_stream->pending_text);
+    m_stream->pending_text = {};
+
+    Buffer* buffer = BufferManager::instance().get_buffer_ifp(m_stream->bufname);
+    if (not buffer)
+        return;
+
+    if (m_ghost and m_ghost->bufname == m_stream->bufname)
+    {
+        String ghost_bufname = std::move(m_ghost->bufname);
+        const BufferCoord ghost_anchor = m_ghost->anchor;
+        String ghost_text = std::move(m_ghost->text);
+        ghost_text += text;
+        set_ghost(*buffer, {std::move(ghost_bufname), ghost_anchor,
+                            std::move(ghost_text), buffer->timestamp()});
+        return;
+    }
+
+    if (buffer->timestamp() != m_stream->timestamp)
+        return; // edited before the first streamed token arrived
+    set_ghost(*buffer, {m_stream->bufname, m_stream->anchor, std::move(text),
+                        m_stream->timestamp});
+}
+
 void FIMManager::set_ghost(Buffer& buffer, Ghost ghost)
 {
     RangeAndStringList specs;
@@ -815,6 +1105,8 @@ void FIMManager::cancel_request()
     ++m_request_generation;
     m_request.reset();
     m_pending_request.reset();
+    m_stream.reset();
+    m_stream_timer.disable();
     m_retry_timer.disable();
     m_retry_count = 0;
 }
@@ -924,6 +1216,7 @@ void FIMManager::accept_impl(Context& context, bool line_only)
         }
     }
     const BufferCoord anchor = m_ghost->anchor;
+    cancel_request();
     clear_ghost();
     {
         ScopedEdition edition{context};
@@ -1020,6 +1313,26 @@ UnitTest test_fim_http{[]()
     kak_assert(trim_prefix_to_bytes(e_accent_prefix, 2) == StringView{"\xC3\xA9"});
     kak_assert(trim_suffix_to_bytes(e_accent_suffix, 1) == "");
     kak_assert(trim_suffix_to_bytes(e_accent_suffix, 2) == StringView{"\xC3\xA9"});
+
+    // server-sent event framing
+    String sse = "data: {\"content\":\"a\",\"stop\":false}\n\n"
+                 "data: {\"content\":\"b\",\"stop\":true}\r\n\r\n";
+    auto event = pop_sse_event(sse);
+    kak_assert(event and *event == "{\"content\":\"a\",\"stop\":false}");
+    String content;
+    bool stop = false;
+    kak_assert(extract_sse_content(*event, content, stop));
+    kak_assert(content == "a" and not stop);
+    event = pop_sse_event(sse);
+    kak_assert(event and *event == "{\"content\":\"b\",\"stop\":true}");
+    kak_assert(extract_sse_content(*event, content, stop));
+    kak_assert(content == "ab" and stop);
+    sse = "data: [DONE]\n\n";
+    event = pop_sse_event(sse);
+    stop = false;
+    content = {};
+    kak_assert(event and extract_sse_content(*event, content, stop));
+    kak_assert(content.empty() and stop);
 
     // content-length framing, case-insensitive headers
     StringView full = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\ncontent-length: 5\r\n\r\nhello";
