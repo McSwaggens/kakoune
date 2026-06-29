@@ -13,6 +13,7 @@
 #include "units.hh"
 #include "ranges.hh"
 
+#include <cstdlib>
 #include <tuple>
 
 namespace Kakoune
@@ -54,6 +55,18 @@ inline bool option_remove(int& opt, StringView str)
     return val != 0;
 }
 constexpr StringView option_type_name(Meta::Type<int>) { return "int"; }
+
+inline String option_to_string(double opt) { return to_string((float)opt); }
+inline double option_from_string(Meta::Type<double>, StringView str)
+{
+    String s{str};
+    char* end = nullptr;
+    double val = strtod(s.c_str(), &end);
+    if (end == s.c_str())
+        throw runtime_error{format("'{}' is not a number", str)};
+    return val;
+}
+constexpr StringView option_type_name(Meta::Type<double>) { return "double"; }
 
 inline String option_to_string(size_t opt) { return to_string(opt); }
 inline size_t option_from_string(Meta::Type<size_t>, StringView str) { return str_to_int(str); }

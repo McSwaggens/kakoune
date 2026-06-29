@@ -18,6 +18,7 @@
 #include "shell_manager.hh"
 #include "string_utils.hh"
 #include "unit_tests.hh"
+#include "utf8.hh"
 
 #include <arpa/inet.h>
 #include <cerrno>
@@ -51,6 +52,27 @@ Optional<ByteCount> find_substr(StringView haystack, StringView needle)
     if (found == haystack.end())
         return {};
     return ByteCount{(int)(found - haystack.begin())};
+}
+
+String trim_prefix_to_bytes(String text, int max_bytes)
+{
+    if (max_bytes <= 0 or text.length() <= ByteCount{max_bytes})
+        return text;
+
+    const char* end = text.begin() + ByteCount{max_bytes};
+    while (end != text.begin() and not utf8::is_character_start(*end))
+        --end;
+    return String{StringView{text.begin(), end}};
+}
+
+String trim_suffix_to_bytes(String text, int max_bytes)
+{
+    if (max_bytes <= 0 or text.length() <= ByteCount{max_bytes})
+        return text;
+
+    const char* begin = text.end() - max_bytes;
+    begin = utf8::finish(begin, text.end());
+    return String{StringView{begin, text.end()}};
 }
 
 const Value* find_member(const Value& v, StringView key)
@@ -451,8 +473,24 @@ FIMManager::FIMManager()
         "completion preview rendered by the fim ghost-text highlighter (managed by fim)", {});
     reg.declare_option<int>("fim_max_tokens",
         "maximum number of tokens a fim completion may generate", 64);
+    reg.declare_option<double>("fim_temperature",
+        "sampling temperature for fim completions; 0 is greedy so identical context yields "
+        "identical results, higher is more varied (negative defers to the server default)",
+        0.0);
     reg.declare_option<int>("fim_context_lines",
         "lines of context sent to the completion server before and after the cursor", 128);
+    reg.declare_option<int>("fim_context_bytes",
+        "maximum bytes of prefix and suffix context sent to the completion server (0 disables the byte cap)",
+        32768);
+    reg.declare_option<int>("fim_predict_timeout_ms",
+        "maximum milliseconds spent generating a fim completion after the first token (0 disables the timeout)",
+        750);
+    reg.declare_option<int>("fim_cache_reuse",
+        "minimum token chunk size llama-server may reuse from the prompt cache (0 disables request-level cache reuse)",
+        256);
+    reg.declare_option<int>("fim_slot",
+        "llama-server slot used for fim requests to keep prompt cache hot (-1 lets the server choose an idle slot)",
+        0);
     reg.declare_option<bool>("fim_debug",
         "log fim http traffic and completion-server output to the *debug* buffer", false);
 
@@ -572,7 +610,10 @@ void FIMManager::request(Context& context)
     clear_ghost();
 
     if (GlobalScope::instance().options()["fim_cmd"].get<String>().empty())
+    {
+        cancel_request();
         return;
+    }
     start_server_ifn(context);
     m_retry_count = 0;
     send_infill(buffer, cursor);
@@ -619,14 +660,45 @@ void FIMManager::send_infill(Buffer& buffer, BufferCoord cursor)
     const BufferCoord begin{std::max(0_line, cursor.line - context_lines), 0};
     const BufferCoord end = std::min(buffer.end_coord(),
                                      BufferCoord{cursor.line + context_lines + 1, 0});
+    String input_prefix = buffer.string(begin, cursor);
+    String input_suffix = buffer.string(cursor, end);
+    const int context_bytes = options["fim_context_bytes"].get<int>();
+    if (context_bytes > 0)
+    {
+        input_prefix = trim_suffix_to_bytes(std::move(input_prefix), context_bytes);
+        input_suffix = trim_prefix_to_bytes(std::move(input_suffix), context_bytes);
+    }
+
     JsonObject body;
-    body.insert({"input_prefix", Value{buffer.string(begin, cursor)}});
-    body.insert({"input_suffix", Value{buffer.string(cursor, end)}});
+    body.insert({"input_prefix", Value{std::move(input_prefix)}});
+    body.insert({"input_suffix", Value{std::move(input_suffix)}});
     body.insert({"n_predict", Value{options["fim_max_tokens"].get<int>()}});
+    const double temperature = options["fim_temperature"].get<double>();
+    if (temperature >= 0)
+        body.insert({"temperature", Value{temperature}});
     body.insert({"stream", Value{false}});
     body.insert({"cache_prompt", Value{true}});
-    // llama-server also accepts t_max_predict_ms, n_indent and input_extra
-    // (cross-file context); left to future tuning.
+    const int predict_timeout = options["fim_predict_timeout_ms"].get<int>();
+    if (predict_timeout > 0)
+        body.insert({"t_max_predict_ms", Value{predict_timeout}});
+    const int cache_reuse = options["fim_cache_reuse"].get<int>();
+    if (cache_reuse > 0)
+        body.insert({"n_cache_reuse", Value{cache_reuse}});
+    const int slot = options["fim_slot"].get<int>();
+    if (slot >= 0)
+        body.insert({"id_slot", Value{slot}});
+
+    JsonArray response_fields;
+    response_fields.push_back(Value{String{"content"}});
+    if (fim_debug_enabled())
+    {
+        response_fields.push_back(Value{String{"tokens_cached"}});
+        response_fields.push_back(Value{String{"tokens_evaluated"}});
+        response_fields.push_back(Value{String{"truncated"}});
+    }
+    body.insert({"response_fields", Value{std::move(response_fields)}});
+    // llama-server also accepts n_indent and input_extra (cross-file context);
+    // left to future tuning.
 
     String request = build_http_post(url->host, url->port, "/infill",
                                      to_json(Value{std::move(body)}));
@@ -634,14 +706,17 @@ void FIMManager::send_infill(Buffer& buffer, BufferCoord cursor)
     String bufname = buffer.name();
     const size_t timestamp = buffer.timestamp();
     m_request.reset(); // cancel any in-flight request
+    m_pending_request.reset();
+    const size_t generation = ++m_request_generation;
     try
     {
         m_request = make_unique_ptr<HttpRequest>(*url, std::move(request),
-            [bufname, cursor, timestamp](bool ok, int status, String response_body) {
+            [generation, bufname, cursor, timestamp](bool ok, int status, String response_body) {
                 if (FIMManager::has_instance())
-                    FIMManager::instance().request_finished(bufname, cursor, timestamp,
+                    FIMManager::instance().request_finished(generation, bufname, cursor, timestamp,
                                                             ok, status, std::move(response_body));
             });
+        m_pending_request = PendingRequest{bufname, timestamp};
         trace(format("requested completion at {}.{}", cursor.line + 1, cursor.column + 1));
     }
     catch (runtime_error& err)
@@ -651,13 +726,18 @@ void FIMManager::send_infill(Buffer& buffer, BufferCoord cursor)
     }
 }
 
-void FIMManager::request_finished(StringView bufname, BufferCoord anchor, size_t timestamp,
+void FIMManager::request_finished(size_t generation, StringView bufname,
+                                  BufferCoord anchor, size_t timestamp,
                                   bool ok, int status, String body)
 {
+    if (generation != m_request_generation)
+        return; // a stale callback from a cancelled request
+
     // Detach before doing anything re-entrant (setting an option fires
     // BufSetOption hooks); also makes destroying the request from its own
     // callback safe. Destroyed when this scope exits.
     auto request = std::move(m_request);
+    m_pending_request.reset();
 
     if (not ok or status == 503) // connection failed, or the model is still loading
     {
@@ -678,6 +758,30 @@ void FIMManager::request_finished(StringView bufname, BufferCoord anchor, size_t
         Value json = parse_json(body).value;
         if (const Value* c = find_member(json, "content"); c and c->is_a<String>())
             content = std::move(c->as<String>());
+        if (fim_debug_enabled())
+        {
+            String metrics;
+            auto append_metric = [&](StringView name) {
+                const Value* v = find_member(json, name);
+                if (not v)
+                    return;
+                String value;
+                if (v->is_a<int>())
+                    value = format("{}", v->as<int>());
+                else if (v->is_a<bool>())
+                    value = v->as<bool>() ? String{"true"} : String{"false"};
+                if (value.empty())
+                    return;
+                if (not metrics.empty())
+                    metrics += ", ";
+                metrics += format("{}={}", name, value);
+            };
+            append_metric("tokens_cached");
+            append_metric("tokens_evaluated");
+            append_metric("truncated");
+            if (not metrics.empty())
+                trace(format("server metrics: {}", metrics));
+        }
     }
     catch (runtime_error& err)
     {
@@ -706,6 +810,15 @@ void FIMManager::set_ghost(Buffer& buffer, Ghost ghost)
     set_buffer_option(buffer, "fim_ghost_text", specs);
 }
 
+void FIMManager::cancel_request()
+{
+    ++m_request_generation;
+    m_request.reset();
+    m_pending_request.reset();
+    m_retry_timer.disable();
+    m_retry_count = 0;
+}
+
 void FIMManager::clear_ghost()
 {
     m_retry_timer.disable();
@@ -720,26 +833,40 @@ void FIMManager::clear_ghost()
 
 void FIMManager::clear(Context&)
 {
-    m_request.reset();
-    m_retry_count = 0;
+    cancel_request();
     clear_ghost();
 }
 
 void FIMManager::on_insert_char(Context& context)
 {
-    if (not m_ghost or not context.has_buffer())
+    if (not context.has_buffer())
+    {
+        cancel_request();
         return;
+    }
     Buffer& buffer = context.buffer();
-    if (m_ghost->bufname != buffer.name())
+    if (not m_ghost)
+    {
+        if (m_pending_request and m_pending_request->bufname == context.buffer().name()
+            and m_pending_request->timestamp != context.buffer().timestamp())
+            cancel_request();
         return;
+    }
+    if (m_ghost->bufname != buffer.name())
+    {
+        cancel_request();
+        return;
+    }
     if (context.selections().size() != 1)
     {
+        cancel_request();
         clear_ghost();
         return;
     }
     const BufferCoord cursor = context.selections().main().cursor();
     if (cursor <= m_ghost->anchor)
     {
+        cancel_request();
         clear_ghost();
         return;
     }
@@ -751,11 +878,13 @@ void FIMManager::on_insert_char(Context& context)
     const StringView ghost_text = m_ghost->text;
     if (not ghost_text.starts_with(typed))
     {
+        cancel_request();
         clear_ghost(); // diverged; the next idle pause requests a fresh one
         return;
     }
     if (typed.length() == ghost_text.length())
     {
+        cancel_request();
         clear_ghost(); // the whole completion was typed out
         return;
     }
@@ -812,17 +941,28 @@ void FIMManager::accept_impl(Context& context, bool line_only)
 // exactly valid — the next idle pause requests a fresh one.
 void FIMManager::menu_hide(Context& context)
 {
-    if (not m_ghost or not context.has_buffer())
+    if (not context.has_buffer())
+    {
+        cancel_request();
         return;
+    }
+    if (not m_ghost)
+    {
+        if (m_pending_request and m_pending_request->bufname == context.buffer().name()
+            and m_pending_request->timestamp != context.buffer().timestamp())
+            cancel_request();
+        return;
+    }
     if (not ghost_intact_at(context.buffer(), context.selections().main().cursor()))
+    {
+        cancel_request();
         clear_ghost();
+    }
 }
 
 void FIMManager::stop(Context&)
 {
-    m_request.reset();
-    m_retry_timer.disable();
-    m_retry_count = 0;
+    cancel_request();
     clear_ghost();
     if (m_server)
     {
@@ -870,6 +1010,16 @@ UnitTest test_fim_http{[]()
     kak_assert(url and url->host == "127.0.0.1" and url->port == 80);
     url = parse_http_url("http://10.0.0.2:80/");
     kak_assert(url and url->host == "10.0.0.2" and url->port == 80);
+
+    // byte caps preserve valid UTF-8 boundaries
+    kak_assert(trim_prefix_to_bytes("abcdef", 3) == "abc");
+    kak_assert(trim_suffix_to_bytes("abcdef", 3) == "def");
+    String e_accent_prefix{StringView{"\xC3\xA9" "abc"}};
+    String e_accent_suffix{StringView{"abc" "\xC3\xA9"}};
+    kak_assert(trim_prefix_to_bytes(e_accent_prefix, 1) == "");
+    kak_assert(trim_prefix_to_bytes(e_accent_prefix, 2) == StringView{"\xC3\xA9"});
+    kak_assert(trim_suffix_to_bytes(e_accent_suffix, 1) == "");
+    kak_assert(trim_suffix_to_bytes(e_accent_suffix, 2) == StringView{"\xC3\xA9"});
 
     // content-length framing, case-insensitive headers
     StringView full = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\ncontent-length: 5\r\n\r\nhello";

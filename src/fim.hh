@@ -48,12 +48,18 @@ private:
         String text;
         size_t timestamp;    // buffer timestamp the ghost is valid for
     };
+    struct PendingRequest
+    {
+        String bufname;
+        size_t timestamp;
+    };
 
     bool ghost_intact_at(const Buffer& buffer, BufferCoord cursor) const;
     void start_server_ifn(const Context& context);
     void send_infill(Buffer& buffer, BufferCoord cursor);
-    void request_finished(StringView bufname, BufferCoord anchor, size_t timestamp,
+    void request_finished(size_t generation, StringView bufname, BufferCoord anchor, size_t timestamp,
                           bool ok, int status, String body);
+    void cancel_request();
     void set_ghost(Buffer& buffer, Ghost ghost);
     void clear_ghost();
     void schedule_retry(String bufname, BufferCoord anchor, size_t timestamp);
@@ -62,6 +68,8 @@ private:
 
     Optional<Ghost> m_ghost;
     UniquePtr<HttpRequest> m_request;        // at most one in flight
+    Optional<PendingRequest> m_pending_request;
+    size_t m_request_generation = 0;         // bumped to ignore stale callbacks
     UniquePtr<FIMServerProcess> m_server;
     bool m_disabled = false;                 // fim-disable persists across windows until fim-enable
     int m_retry_count = 0;
