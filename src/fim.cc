@@ -3,6 +3,7 @@
 #include "buffer.hh"
 #include "buffer_manager.hh"
 #include "buffer_utils.hh"
+#include "client_manager.hh"
 #include "command_manager.hh"
 #include "context.hh"
 #include "file.hh"
@@ -44,6 +45,11 @@ bool fim_debug_enabled()
 void debug(StringView msg) { write_to_debug_buffer(format("fim: {}", msg)); }
 // Verbose traffic/info; only written when the fim_debug option is set.
 void trace(StringView msg) { if (fim_debug_enabled()) write_to_debug_buffer(format("fim: {}", msg)); }
+
+bool is_blank_completion(StringView text)
+{
+    return all_of(text, [](char c) { return c == ' ' or c == '\t' or c == '\n' or c == '\r'; });
+}
 
 Optional<ByteCount> find_substr(StringView haystack, StringView needle)
 {
@@ -669,7 +675,7 @@ void drain_server_output(FDWatcher& watcher, String& buf, bool& exited)
 
 FIMManager::FIMManager()
     : m_retry_timer{TimePoint::max(), [this](Timer&) { retry(); }},
-      m_stream_timer{TimePoint::max(), [this](Timer&) { flush_stream(); }, EventMode::Urgent}
+      m_stream_timer{TimePoint::max(), [this](Timer&) { flush_stream(); }}
 {
     auto& reg = GlobalScope::instance().option_registry();
     reg.declare_option<String>("fim_cmd",
@@ -940,7 +946,7 @@ void FIMManager::send_infill(Buffer& buffer, BufferCoord cursor)
                 }} : HttpRequest::OnData{});
         m_pending_request = PendingRequest{bufname, timestamp};
         if (streamed)
-            m_stream = Stream{generation, bufname, cursor, timestamp, {}, {}};
+            m_stream = Stream{generation, bufname, cursor, timestamp, {}, false, {}, false};
         trace(format("requested completion at {}.{}", cursor.line + 1, cursor.column + 1));
     }
     catch (runtime_error& err)
@@ -980,9 +986,11 @@ void FIMManager::request_finished(size_t generation, StringView bufname,
 
     if (streamed)
     {
-        flush_stream();
-        m_stream_timer.disable();
-        m_stream.reset();
+        if (m_stream and m_stream->generation == generation)
+        {
+            m_stream->finished = true;
+            m_stream_timer.set_next_date(Clock::now());
+        }
         return;
     }
 
@@ -1022,7 +1030,7 @@ void FIMManager::request_finished(size_t generation, StringView bufname,
         debug(format("failed to parse completion response: {}", err.what()));
         return;
     }
-    if (all_of(content, [](char c) { return c == ' ' or c == '\t' or c == '\n' or c == '\r'; }))
+    if (is_blank_completion(content))
         return; // empty or whitespace-only completion
 
     Buffer* buffer = BufferManager::instance().get_buffer_ifp(bufname);
@@ -1044,33 +1052,59 @@ void FIMManager::stream_data(size_t generation, StringView bufname,
         return;
 
     m_stream->event_buffer += data;
-    while (auto event = pop_sse_event(m_stream->event_buffer))
-    {
-        String content;
-        bool stop = false;
-        if (extract_sse_content(*event, content, stop) and not content.empty())
-            m_stream->pending_text += content;
-        if (stop)
-            break;
-    }
-
-    if (not m_stream->pending_text.empty())
+    if (find_sse_delimiter(m_stream->event_buffer))
         m_stream_timer.set_next_date(Clock::now());
 }
 
 void FIMManager::flush_stream()
 {
-    if (not m_stream or m_stream->pending_text.empty())
+    if (not m_stream)
         return;
     if (m_stream->generation != m_request_generation)
         return;
+
+    auto schedule_next = [&] {
+        if (not m_stream)
+            return;
+        if (find_sse_delimiter(m_stream->event_buffer))
+            m_stream_timer.set_next_date(Clock::now());
+        else if (m_stream->finished)
+            m_stream.reset();
+    };
+
+    auto event = pop_sse_event(m_stream->event_buffer);
+    if (event)
+    {
+        String content;
+        bool stop = false;
+        if (extract_sse_content(*event, content, stop))
+        {
+            if (not content.empty())
+            {
+                if (not is_blank_completion(content))
+                    m_stream->has_nonblank = true;
+                m_stream->pending_text += content;
+            }
+            if (stop)
+                m_stream->finished = true;
+        }
+    }
+
+    if (m_stream->pending_text.empty() or not m_stream->has_nonblank)
+    {
+        schedule_next();
+        return;
+    }
 
     String text = std::move(m_stream->pending_text);
     m_stream->pending_text = {};
 
     Buffer* buffer = BufferManager::instance().get_buffer_ifp(m_stream->bufname);
     if (not buffer)
+    {
+        m_stream.reset();
         return;
+    }
 
     if (m_ghost and m_ghost->bufname == m_stream->bufname)
     {
@@ -1080,13 +1114,20 @@ void FIMManager::flush_stream()
         ghost_text += text;
         set_ghost(*buffer, {std::move(ghost_bufname), ghost_anchor,
                             std::move(ghost_text), buffer->timestamp()});
+        ClientManager::instance().redraw_clients();
+        schedule_next();
         return;
     }
 
     if (buffer->timestamp() != m_stream->timestamp)
+    {
+        m_stream.reset();
         return; // edited before the first streamed token arrived
+    }
     set_ghost(*buffer, {m_stream->bufname, m_stream->anchor, std::move(text),
                         m_stream->timestamp});
+    ClientManager::instance().redraw_clients();
+    schedule_next();
 }
 
 void FIMManager::set_ghost(Buffer& buffer, Ghost ghost)
@@ -1315,6 +1356,9 @@ UnitTest test_fim_http{[]()
     kak_assert(trim_suffix_to_bytes(e_accent_suffix, 2) == StringView{"\xC3\xA9"});
 
     // server-sent event framing
+    kak_assert(is_blank_completion(""));
+    kak_assert(is_blank_completion(" \t\n\r"));
+    kak_assert(not is_blank_completion(" \nfoo"));
     String sse = "data: {\"content\":\"a\",\"stop\":false}\n\n"
                  "data: {\"content\":\"b\",\"stop\":true}\r\n\r\n";
     auto event = pop_sse_event(sse);

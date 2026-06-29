@@ -60,7 +60,9 @@ private:
         BufferCoord anchor;
         size_t timestamp;
         String event_buffer;
+        bool has_nonblank = false;
         String pending_text;
+        bool finished = false;
     };
 
     bool ghost_intact_at(const Buffer& buffer, BufferCoord cursor) const;
