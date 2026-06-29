@@ -36,6 +36,7 @@ public:
     void on_insert_char(Context& context); // InsertChar: consume the ghost as it is typed out
     void clear(Context& context);          // movement/delete/mode change: drop ghost + in-flight
     void accept(Context& context);         // insert the ghost text at the cursor
+    void accept_or_fail(Context& context); // like accept, but errors when no ghost is ready
     void accept_line(Context& context);    // insert the ghost's first line, keep the rest
     void menu_hide(Context& context);      // menu closed: drop the preview if it went stale
     void stop(Context& context);           // kill the completion server
@@ -78,7 +79,7 @@ private:
     void clear_ghost();
     void schedule_retry(String bufname, BufferCoord anchor, size_t timestamp);
     void retry();
-    void accept_impl(Context& context, bool line_only);
+    bool accept_impl(Context& context, bool line_only);
 
     Optional<Ghost> m_ghost;
     UniquePtr<HttpRequest> m_request;        // at most one in flight

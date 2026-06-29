@@ -730,6 +730,7 @@ FIMManager::FIMManager()
     cmd("fim-on-char", "advance the completion preview over typed text", &FIMManager::on_insert_char);
     cmd("fim-clear", "discard the completion preview and any pending request", &FIMManager::clear);
     cmd("fim-accept", "insert the previewed ai completion", &FIMManager::accept);
+    cmd("fim-accept-or-fail", "insert the previewed ai completion, failing if none is ready", &FIMManager::accept_or_fail);
     cmd("fim-accept-line", "insert the first line of the previewed ai completion", &FIMManager::accept_line);
     cmd("fim-menu-hide", "drop the completion preview if the menu inserted text", &FIMManager::menu_hide);
     cmd("fim-stop", "stop the ai completion server", &FIMManager::stop);
@@ -767,10 +768,8 @@ void FIMManager::enable_window(Context& context)
     run("hook -group fim window InsertMove .* fim-clear");
     run("hook -group fim window ModeChange pop:insert:.* fim-clear");
     run("hook -group fim window InsertCompletionHide .* fim-menu-hide");
-    // Dedicated accept keys — the completion menu owns <tab> for most setups.
-    // Never fight an existing insert-mode mapping (any scope).
-    if (not context.keymaps().is_mapped(Key{Key::Modifiers::Control, 'f'}, KeymapMode::Insert))
-        run("map window insert <c-f> '<a-;>:fim-accept<ret>'");
+    // Dedicated line-accept key. Full accept is intentionally left to config
+    // so <tab> can compose with completion-menu and snippet mappings.
     if (not context.keymaps().is_mapped(Key{Key::Modifiers::Alt, Key::Tab}, KeymapMode::Insert))
         run("map window insert <a-tab> '<a-;>:fim-accept-line<ret>'");
 
@@ -1226,12 +1225,19 @@ void FIMManager::on_insert_char(Context& context)
 }
 
 void FIMManager::accept(Context& context) { accept_impl(context, false); }
+
+void FIMManager::accept_or_fail(Context& context)
+{
+    if (not accept_impl(context, false))
+        throw runtime_error("no fim completion to accept");
+}
+
 void FIMManager::accept_line(Context& context) { accept_impl(context, true); }
 
-void FIMManager::accept_impl(Context& context, bool line_only)
+bool FIMManager::accept_impl(Context& context, bool line_only)
 {
     if (not context.has_buffer())
-        return;
+        return false;
     Buffer& buffer = context.buffer();
     auto& selections = context.selections();
 
@@ -1241,7 +1247,7 @@ void FIMManager::accept_impl(Context& context, bool line_only)
         and m_ghost->timestamp == buffer.timestamp();
 
     if (not ghost_ready)
-        return;
+        return false;
 
     String text = m_ghost->text;
     String remainder;
@@ -1267,6 +1273,7 @@ void FIMManager::accept_impl(Context& context, bool line_only)
     if (not remainder.empty())
         set_ghost(buffer, {buffer.name(), selections.main().cursor(),
                            std::move(remainder), buffer.timestamp()});
+    return true;
 }
 
 // The ghost coexists with the completion menu (it renders in the text, the
